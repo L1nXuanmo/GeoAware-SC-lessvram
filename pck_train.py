@@ -318,7 +318,10 @@ def train(args, aggre_net, corr_map_net, optimizer, scheduler, logger, save_path
                     # Evaluate model periodically, at the end of the dataset, or under specific conditions
                     if (pair_idx % args.EVAL_EPOCH == 0 and pair_idx > 0) or pair_idx == N-1:  # Evaluate every args.EVAL_EPOCH iterations and at the end of the dataset
                         pck_010, pck_005, pck_001, total_result = eval(args, aggre_net, save_path)  # Perform evaluation
-                        wandb_dict = {'pck_010': pck_010, 'pck_005': pck_005, 'pck_001': pck_001}
+                        if args.EVAL_DATASET == "pascal":
+                            wandb_dict = {'pck_010': pck_010, 'pck_005': pck_005, 'pck_015': pck_001}
+                        else:
+                            wandb_dict = {'pck_010': pck_010, 'pck_005': pck_005, 'pck_001': pck_001}
                         # Update best model based on PCK scores and dataset type
                         if (pck_010 > max_pck_010 and args.EVAL_DATASET != 'pascal') or (pck_005 > max_pck_005 and args.EVAL_DATASET == 'pascal'): # different criteria for PASCAL_EVAL
                             max_pck_010, max_pck_005, max_pck_001 = pck_010, pck_005, pck_001
@@ -327,7 +330,10 @@ def train(args, aggre_net, corr_map_net, optimizer, scheduler, logger, save_path
                         else:
                             torch.save(aggre_net.state_dict(), f'{save_path}/last.pth') # Save the last model if it's not the best
                         # Log the best PCK scores
-                        logger.info(f'Best PCK0.10: {max_pck_010 * 100:.2f}% at step {max_iter}, with PCK0.05: {max_pck_005 * 100:.2f}%, PCK0.01: {max_pck_001 * 100:.2f}%')
+                        if args.EVAL_DATASET == "pascal":
+                            logger.info(f'Best PCK0.10: {max_pck_010 * 100:.2f}% at step {max_iter}, with PCK0.05: {max_pck_005 * 100:.2f}%, PCK0.15: {max_pck_001 * 100:.2f}%')
+                        else:
+                            logger.info(f'Best PCK0.10: {max_pck_010 * 100:.2f}% at step {max_iter}, with PCK0.05: {max_pck_005 * 100:.2f}%, PCK0.01: {max_pck_001 * 100:.2f}%')
                         if not args.NOT_WANDB: wandb.log(wandb_dict, step=pair_idx + epoch * N)
 
             batch_loss /= args.BZ
