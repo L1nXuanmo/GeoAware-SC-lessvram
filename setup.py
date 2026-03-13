@@ -13,7 +13,7 @@ setup(
     py_modules=[],
     install_requires=[
         "loguru>=0.5.3",
-        "faiss-cpu==1.7.1",
+        "faiss-cpu==1.7.1.post3",
         "matplotlib>=3.4.2",
         "tqdm>=4.61.2",
         "numpy==1.23.5",
