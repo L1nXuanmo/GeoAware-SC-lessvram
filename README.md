@@ -95,7 +95,3 @@ Suggested values:
 ## License / Citation
 
 This fork builds on the original GeoAware-SC project. Please follow the original license and citation requirements from upstream.
-
-## Acknowledgement
-
-Our code is largely based on the following open-source projects: [A Tale of Two Features](https://github.com/Junyi42/sd-dino), [Diffusion Hyperfeatures](https://github.com/diffusion-hyperfeatures/diffusion_hyperfeatures), [DIFT](https://github.com/Tsingularity/dift), [DenseMatching](https://github.com/PruneTruong/DenseMatching), and [SFNet](https://github.com/cvlab-yonsei/SFNet). Our heartfelt gratitude goes to the developers of these resources!
