@@ -17,7 +17,8 @@
 import logging
 import os
 from typing import Optional
-import pkg_resources
+# pkg_resources removed: setuptools>=82 no longer exposes it at top-level.
+# Replaced usage below with os.path / __file__ (equivalent, no extra dep).
 import torch
 from detectron2.config import LazyConfig
 
@@ -86,9 +87,9 @@ def get_config_file(config_path):
     Returns:
         str: the real path to the config file.
     """
-    cfg_file = pkg_resources.resource_filename(
-        "odise.model_zoo", os.path.join("configs", config_path)
-    )
+    # Originally: pkg_resources.resource_filename("odise.model_zoo", "configs/<path>")
+    # Replaced with __file__-relative path — identical result, no pkg_resources needed.
+    cfg_file = os.path.join(os.path.dirname(__file__), "configs", config_path)
     if not os.path.exists(cfg_file):
         raise RuntimeError("{} not available in Model Zoo!".format(config_path))
     return cfg_file

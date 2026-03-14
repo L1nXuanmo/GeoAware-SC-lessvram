@@ -82,12 +82,21 @@ class StableDiffusionSeg(object):
         self.aug(aug_input)
         image = aug_input.image
         image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+        # Auto-cast input to match model dtype (supports FP16 half-precision mode)
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.float32
+        image = image.to(dtype=model_dtype)
 
         inputs = {"image": image, "height": height, "width": width}
-        if caption is not None:
-            features = self.model.get_features([inputs],caption,pca=pca)
-        else:
-            features = self.model.get_features([inputs],pca=pca)
+        # When model is in FP16, wrap forward with autocast to handle all internal
+        # FP32->FP16 conversions automatically (e.g. timestep_embedding outputs, etc.)
+        with torch.amp.autocast('cuda', dtype=torch.float16, enabled=(model_dtype == torch.float16)):
+            if caption is not None:
+                features = self.model.get_features([inputs],caption,pca=pca)
+            else:
+                features = self.model.get_features([inputs],pca=pca)
         return features
     
     def predict(self, original_image):
@@ -160,7 +169,12 @@ def build_demo_classes_and_metadata(vocab, label_list):
 import sys
 
 
-def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusion_ver="v1-3", image_size=1024, num_timesteps=0, block_indices=(2,5,8,11), decoder_only=True, encoder_only=False, resblock_only=False):
+def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusion_ver="v1-3", image_size=1024, num_timesteps=0, block_indices=(2,5,8,11), decoder_only=True, encoder_only=False, resblock_only=False, half_precision=False):
+    """
+    half_precision: if True, convert model to FP16 after loading (~halves VRAM).
+                    Requires input images to also be cast to FP16 (handled automatically
+                    by StableDiffusionSeg.get_features via dtype auto-detection).
+    """
     cfg = model_zoo.get_config(config_path, trained=True)
 
     cfg.model.backbone.feature_extractor.init_checkpoint = "sd://"+diffusion_ver
@@ -182,6 +196,9 @@ def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusio
     model = instantiate_odise(cfg.model)
     model.to(cfg.train.device)
     ODISECheckpointer(model).load(cfg.train.init_checkpoint)
+
+    if half_precision:
+        model.half()
 
     return model, aug
 

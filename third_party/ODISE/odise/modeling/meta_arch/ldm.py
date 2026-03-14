@@ -998,6 +998,8 @@ class LdmImplicitCaptionerExtractor(nn.Module):
         image = batched_inputs["img"]
 
         prefix = self.clip.embed_image(image).image_embed
+        # Cast CLIP embedding to match clip_project weight dtype (needed when model is in FP16)
+        prefix = prefix.to(dtype=next(self.clip_project.parameters()).dtype)
         prefix_embed = self.clip_project(prefix)
         
         if "caption" not in batched_inputs or batched_inputs["caption"] is None:
