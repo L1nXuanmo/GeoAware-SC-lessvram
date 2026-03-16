@@ -17,26 +17,35 @@ This script:
 
 Usage
 -----
+    # Recommended: pass intrinsics file (3×3 .npy matrix)
     python keypoints/kp_3d.py \\
         --kps   path/to/color_kps.json \\
         --rgb   path/to/color.png \\
         --depth path/to/depth.png \\
-        [--fx 605.0] [--fy 605.0] [--cx 640.0] [--cy 360.0] \\
+        --intr  path/to/cam_intr.npy \\
         [--depth-scale 1000.0] \\
         [--depth-max   3.0] \\
         [--no-save] \\
         [--no-vis]
 
-    # Example (bowl template):
+    # Or: specify intrinsics manually (fallback if no --intr)
     python keypoints/kp_3d.py \\
-        --kps   data/templates/bowl01/color_kps.json \\
-        --rgb   data/templates/bowl01/color.png \\
-        --depth data/templates/bowl01/depth.png
+        --kps   path/to/color_kps.json \\
+        --rgb   path/to/color.png \\
+        --depth path/to/depth.png \\
+        --fx 636.3 --fy 636.3 --cx 640 --cy 360
 
-Camera intrinsics (--fx, --fy, --cx, --cy)
-------------------------------------------
-  Defaults match a 1280×720 RealSense D-series sensor.
-  Adjust for your actual camera calibration.
+Camera intrinsics (--intr / --fx --fy --cx --cy)
+------------------------------------------------
+  --intr  path/to/cam_intr.npy   (preferred)
+    Loads a 3×3 NumPy intrinsic matrix:
+      [[fx,  0, cx],
+       [ 0, fy, cy],
+       [ 0,  0,  1]]
+    This overrides --fx/--fy/--cx/--cy if both are given.
+
+  --fx/--fy/--cx/--cy
+    Manual fallback. Defaults are 0 (triggers a warning if no --intr).
 
 Depth encoding (--depth-scale)
 -------------------------------
@@ -186,14 +195,17 @@ def main() -> None:
     parser.add_argument("--depth", required=True,
                         help="Path to depth image  (16-bit PNG in mm, .npy, or .exr)")
     # camera intrinsics ──────────────────────────────────────────────────────
-    parser.add_argument("--fx",  type=float, default=605.0,
-                        help="Focal length x  (pixels, default 605)")
-    parser.add_argument("--fy",  type=float, default=605.0,
-                        help="Focal length y  (pixels, default 605)")
-    parser.add_argument("--cx",  type=float, default=640.0,
-                        help="Principal point x  (pixels, default 640 for 1280-wide)")
-    parser.add_argument("--cy",  type=float, default=360.0,
-                        help="Principal point y  (pixels, default 360 for 720-tall)")
+    parser.add_argument("--intr", type=str, default=None,
+                        help="Path to 3×3 intrinsic matrix (.npy)  "
+                             "— overrides --fx/fy/cx/cy if provided")
+    parser.add_argument("--fx",  type=float, default=0.0,
+                        help="Focal length x  (pixels; ignored if --intr given)")
+    parser.add_argument("--fy",  type=float, default=0.0,
+                        help="Focal length y  (pixels; ignored if --intr given)")
+    parser.add_argument("--cx",  type=float, default=0.0,
+                        help="Principal point x  (pixels; ignored if --intr given)")
+    parser.add_argument("--cy",  type=float, default=0.0,
+                        help="Principal point y  (pixels; ignored if --intr given)")
     # depth encoding ─────────────────────────────────────────────────────────
     parser.add_argument("--depth-scale", type=float, default=1000.0,
                         help="Divide raw depth by this to get metres  "
@@ -207,7 +219,20 @@ def main() -> None:
                         help="Skip Open3D visualisation")
     args = parser.parse_args()
 
-    fx, fy, cx, cy = args.fx, args.fy, args.cx, args.cy
+    # ── resolve camera intrinsics ─────────────────────────────────────────────
+    if args.intr is not None:
+        K = np.load(args.intr)
+        assert K.shape == (3, 3), f"Expected 3×3 intrinsic matrix, got {K.shape}"
+        fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+        print(f"Loaded intrinsics from {args.intr}")
+        print(f"  fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
+    else:
+        fx, fy, cx, cy = args.fx, args.fy, args.cx, args.cy
+        if fx == 0 or fy == 0:
+            print("[warn] No --intr file and --fx/--fy are 0.  "
+                  "Back-projection will be incorrect!\n"
+                  "       Pass --intr path/to/cam_intr.npy  or  "
+                  "--fx/--fy/--cx/--cy manually.")
 
     # ── load inputs ──────────────────────────────────────────────────────────
     print(f"Loading keypoints : {args.kps}")
