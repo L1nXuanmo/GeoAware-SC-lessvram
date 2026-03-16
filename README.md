@@ -56,22 +56,22 @@ mamba run -n geo-aware-5090 pip install -e third_party/ODISE --no-deps
 ```bash
 # Default (FP32)
 mamba run -n geo-aware-5090 python keypoints/kp_match.py \
-  --src data/01_fix_dual/test/source/image.png \
-  --kps data/01_fix_dual/test/source/image_kps.json \
-  --tgt data/01_fix_dual/test/target/image.png
+  --src path/to/source.png \
+  --kps path/to/source_kps.json \
+  --tgt path/to/target.png
 
 # Low-VRAM mode (recommended on 12GB cards)
 mamba run -n geo-aware-5090 python keypoints/kp_match.py \
-  --src data/01_fix_dual/test/source/image.png \
-  --kps data/01_fix_dual/test/source/image_kps.json \
-  --tgt data/01_fix_dual/test/target/image.png \
+  --src path/to/source.png \
+  --kps path/to/source_kps.json \
+  --tgt path/to/target.png \
   --fp16
 
 # If still OOM, lower SD input resolution
 mamba run -n geo-aware-5090 python keypoints/kp_match.py \
-  --src data/01_fix_dual/test/source/image.png \
-  --kps data/01_fix_dual/test/source/image_kps.json \
-  --tgt data/01_fix_dual/test/target/image.png \
+  --src path/to/source.png \
+  --kps path/to/source_kps.json \
+  --tgt path/to/target.png \
   --fp16 --sd-size 768
 ```
 

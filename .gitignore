@@ -18,11 +18,13 @@ SPair-71k
 third_party/ODISE/odise/model_zoo/configs
 wandb
 
-# ── robot datasets (all subdirs under data/ except helper scripts) ────────────
-data/01_fix_dual
+# ── user datasets (all subdirs under data/ except helper scripts) ───────────
+# Excludes any dataset directory placed under data/
+# Tracked exceptions: data/*.sh, data/*.txt (helper scripts kept in repo)
+data/*/
 
 # ── pre-extracted features ────────────────────────────────────────────────────
 *_sd.pt
 *_dino.pt
 features/
-features_ensemble*/fix_dual
+features_ensemble*/
