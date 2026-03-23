@@ -1,77 +1,106 @@
 """
-Template keypoint selector for GeoAware-SC based cross-category grasping pipeline.
+Topology keypoint selector for GeoAware-SC grasping pipeline.
 
-Usage:
-    python keypoints/select.py <image_path>
+Build an expert-demonstration "topology graph" on a single image:
+  * Freely place any number of keypoints
+  * Assign each point to a Part (digit keys 0-9, preset as part_0 ... part_9)
+  * Connect points with edges (Tab -> EDGE mode)
+  * Rename used Parts before saving (optional)
+
+Usage
+-----
+    python keypoints/kp_select.py <image_path>
 
 Output (saved alongside the input image):
-    <image_stem>_kps.json   — keypoints in SPair-compatible format
-    <image_stem>_kps.png    — visualization of selected keypoints
+    <image_stem>_topo.npy   -- topology dict  (np.load(..., allow_pickle=True).item())
+    <image_stem>_topo.png   -- visualisation
 
-JSON format (compatible with project's preprocess_kps_pad / load_spair_data):
+.npy dict structure
+-------------------
     {
-        "image_width":  <int>,
-        "image_height": <int>,
-        "kps": {
-            "0": [x, y],   # pixel coords in original image space
-            "1": [x, y],
-            ...
-        },
-        "keypoint_names": ["name0", "name1", ...]  # optional names
+        "image_path":   str,
+        "image_width":  int,
+        "image_height": int,
+        "nodes":        np.ndarray,   # (N, 2) int32  -- [x, y] pixel coords
+        "node_parts":   np.ndarray,   # (N,)   int32  -- part id per node
+        "part_names":   dict,         # {int: str}     e.g. {0: "handle", 2: "rim"}
+        "adj_matrix":   np.ndarray,   # (N, N) int32  -- 0=no edge, 1=intra-part, 2=inter-part
     }
 
-Controls:
-    Left-click   → add keypoint
-    Right-click  → remove last keypoint
-    'd' key      → remove last keypoint
-    'u' key      → undo all (clear)
-    Enter / 'q'  → save & exit
-    Esc          → exit WITHOUT saving
+Controls -- SELECT mode (default)
+----------------------------------
+    Left-click      -> add keypoint (assigned to current Part)
+    Right-click / D -> remove last keypoint
+    U               -> clear ALL keypoints & edges
+    0-9             -> switch active Part id
+    Tab             -> toggle to EDGE mode
+    Enter / Q       -> quick-save with default part names & exit
+    N               -> name parts in terminal, then save & exit
+    Esc             -> exit WITHOUT saving
+    Scroll          -> zoom
 
-Keypoint order (fixed):
-    Point 0 → Grasp   (grasping contact point)
-    Point 1 → Func    (functional reference point)
+Controls -- EDGE mode
+----------------------
+    Left-click  -> select nearest point; click a 2nd point to form an edge
+    Right-click / D -> cancel pending selection, or undo last edge
+    Tab         -> toggle back to SELECT mode
+    Enter / Q       -> quick-save with default part names & exit
+    N               -> name parts in terminal, then save & exit
+    Esc             -> exit WITHOUT saving
+    Scroll      -> zoom
 """
 
 import argparse
-import json
 import os
 import sys
 
 import matplotlib
-matplotlib.use('TkAgg')          # interactive backend; fall back to Qt5Agg if needed
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 from PIL import Image
 
-# ─── colour palette (cycles if more than 20 points) ────────────────────────
-_COLOURS = [
-    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-    '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
-    '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000',
-    '#aaffc3', '#808000', '#ffd8b1', '#000075', '#a9a9a9',
+# ─── colour palette per Part id (cycles after 20) ───────────────────────────
+_PART_COLOURS = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
+    '#dcbeff', '#9A6324', '#fffac8', '#800000', '#aaffc3',
+    '#808000', '#ffd8b1', '#000075', '#a9a9a9', '#ffe119',
 ]
 
-def _colour(idx: int) -> str:
-    return _COLOURS[idx % len(_COLOURS)]
+_EDGE_COLOUR_INTRA = '#ffffff'
+_EDGE_COLOUR_INTER = '#ff6600'
+
+_SNAP_RADIUS = 15  # pixels — max distance to "click on" a point in EDGE mode
 
 
-class KeypointSelector:
-    """Interactive keypoint selector backed by Matplotlib."""
+def _part_colour(part_id: int) -> str:
+    return _PART_COLOURS[part_id % len(_PART_COLOURS)]
 
-    # Fixed semantic names — not configurable via CLI
-    FIXED_NAMES = ['Grasp', 'Func']
+
+class TopologySelector:
+    """Interactive topology builder backed by Matplotlib."""
 
     def __init__(self, image_path: str):
         self.image_path = os.path.abspath(image_path)
         self.img = Image.open(self.image_path).convert('RGB')
         self.img_w, self.img_h = self.img.size
-        self.names = self.FIXED_NAMES
 
-        self.points: list[tuple[float, float]] = []   # (x, y) in image pixels
+        # ── state ────────────────────────────────────────────────────────────
+        self.mode: str = 'SELECT'              # 'SELECT' or 'EDGE'
+        self.current_part: int = 0             # active Part for new points
+
+        self.points: list[tuple[int, int]] = []   # (x, y) per node
+        self.node_parts: list[int] = []            # parallel list — part id per node
+
+        self.edges: list[tuple[int, int]] = []     # (node_i, node_j) pairs
+        self._edge_first: int | None = None        # first endpoint while building an edge
+
+        # preset Part names: part_0 … part_9 (user can rename used ones on save)
+        self.part_names: dict[int, str] = {i: f'part_{i}' for i in range(10)}
+
         self._saved = False
-
         self._build_ui()
 
     # ── UI setup ─────────────────────────────────────────────────────────────
@@ -79,7 +108,7 @@ class KeypointSelector:
     def _build_ui(self):
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.fig.canvas.manager.set_window_title(
-            f'Select keypoints — {os.path.basename(self.image_path)}'
+            f'Topology selector — {os.path.basename(self.image_path)}'
         )
         self.ax.imshow(np.array(self.img))
         self._set_title()
@@ -89,74 +118,169 @@ class KeypointSelector:
         self.fig.canvas.mpl_connect('key_press_event', self._on_key)
         self.fig.canvas.mpl_connect('close_event', self._on_close)
         self.fig.canvas.mpl_connect('scroll_event', self._on_scroll)
-        # Store current view limits for zoom
-        self._zoom_scale = 1.0
 
-    # ── event handlers ────────────────────────────────────────────────────────
+    # ── title bar ────────────────────────────────────────────────────────────
 
     def _set_title(self):
-        next_idx = len(self.points)
-        if next_idx < len(self.names):
-            next_name = self.names[next_idx]
-            prompt = f'Select Grasp first (pt0), then Func (pt1)  --  Next: [{next_idx}] {next_name}'
+        pname = self.part_names.get(self.current_part, f'part_{self.current_part}')
+
+        if self.mode == 'SELECT':
+            line1 = (f'[SELECT]  Part={pname} (id {self.current_part})  |  '
+                      f'{len(self.points)} nodes  {len(self.edges)} edges')
+            line2 = ('Left: add point  |  Right/D: undo  |  U: clear all  |  '
+                      '0-9: switch Part  |  Tab: edge mode  |  N: name & save  |  Enter/Q: quick save')
         else:
-            prompt = f'All {len(self.names)} points selected  |  Press Enter/Q to save'
-        self.ax.set_title(
-            f'{prompt}\nLeft-click: add  |  Right-click/D: undo  |  U: clear  |  Enter/Q: save & quit  |  Esc: cancel  |  Scroll: zoom',
-            fontsize=9,
-        )
+            pending = '  (click 2nd point)' if self._edge_first is not None else ''
+            line1 = (f'[EDGE]  {len(self.points)} nodes  {len(self.edges)} edges'
+                      f'{pending}')
+            line2 = ('Left: select point pair  |  Right/D: undo edge  |  '
+                      'Tab: select mode  |  N: name & save  |  Enter/Q: quick save')
+
+        self.ax.set_title(f'{line1}\n{line2}', fontsize=9)
+
+    # ── event handlers ────────────────────────────────────────────────────────
 
     def _on_click(self, event):
         if event.inaxes != self.ax:
             return
-        if event.button == 1:            # left click → add
-            if len(self.points) >= len(self.names):
-                print(f'[kp_select] All {len(self.names)} points selected (Grasp + Func). Press U to clear and reselect.')
-                return
-            # snap to integer pixel grid so depth lookup is exact
+
+        if self.mode == 'SELECT':
+            self._on_click_select(event)
+        else:
+            self._on_click_edge(event)
+
+    def _on_click_select(self, event):
+        if event.button == 1:                    # left click → add point
             x, y = int(round(event.xdata)), int(round(event.ydata))
             self.points.append((x, y))
+            self.node_parts.append(self.current_part)
             self._refresh()
-        elif event.button == 3:          # right click → remove last
-            if self.points:
-                self.points.pop()
+        elif event.button == 3:                  # right click → remove last point
+            self._undo_last_point()
+
+    def _on_click_edge(self, event):
+        if event.button == 1:                    # left click → pick point
+            hit = self._find_nearest(event.xdata, event.ydata)
+            if hit is None:
+                return
+            if self._edge_first is None:
+                self._edge_first = hit
+                self._refresh()                  # highlight first point
+            else:
+                second = hit
+                first = self._edge_first
+                self._edge_first = None
+                if first == second:
+                    print('[topo] Self-loop ignored.')
+                    self._refresh()
+                    return
+                # canonical order (smaller first) to ease duplicate check
+                edge = (min(first, second), max(first, second))
+                if edge in self.edges:
+                    print(f'[topo] Edge {edge} already exists.')
+                else:
+                    self.edges.append(edge)
                 self._refresh()
+        elif event.button == 3:                  # right click → undo
+            self._undo_edge()
 
     def _on_key(self, event):
-        if event.key in ('enter', 'q'):
-            self._save()
+        key = event.key
+
+        # ── mode-independent keys ────────────────────────────────────────────
+        if key in ('enter', 'q'):
+            self._quick_save()
+            return
+        if key == 'n':
+            self._named_save()
+            return
+        if key == 'escape':
+            print('[topo] Cancelled — nothing saved.')
             plt.close(self.fig)
-        elif event.key == 'escape':
-            print('[select.py] Cancelled — nothing saved.')
-            plt.close(self.fig)
-        elif event.key in ('d', 'backspace'):
-            if self.points:
-                self.points.pop()
+            return
+        if key == 'tab':
+            self._toggle_mode()
+            return
+
+        # ── SELECT mode keys ────────────────────────────────────────────────
+        if self.mode == 'SELECT':
+            if key in ('d', 'backspace'):
+                self._undo_last_point()
+            elif key == 'u':
+                self.points.clear()
+                self.node_parts.clear()
+                self.edges.clear()
+                self._edge_first = None
                 self._refresh()
-        elif event.key == 'u':
-            self.points.clear()
-            self._refresh()
+            elif key in [str(d) for d in range(10)]:
+                self.current_part = int(key)
+                self._refresh()                  # update title
+            return
+
+        # ── EDGE mode keys ───────────────────────────────────────────────────
+        if self.mode == 'EDGE':
+            if key in ('d', 'backspace'):
+                self._undo_edge()
+            return
 
     def _on_scroll(self, event):
-        """Scroll wheel zoom centred on the cursor position."""
         if event.inaxes != self.ax:
             return
         factor = 0.8 if event.button == 'up' else 1.25
         cx, cy = event.xdata, event.ydata
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
-        new_xlim = [cx + (x - cx) * factor for x in xlim]
-        new_ylim = [cy + (y - cy) * factor for y in ylim]
-        self.ax.set_xlim(new_xlim)
-        self.ax.set_ylim(new_ylim)
+        self.ax.set_xlim([cx + (x - cx) * factor for x in xlim])
+        self.ax.set_ylim([cy + (y - cy) * factor for y in ylim])
         self.fig.canvas.draw_idle()
 
     def _on_close(self, event):
-        # If the window is closed without explicit save, still save if any points exist
         if not self._saved and self.points:
-            ans = input('\n[kp_select] Window closed. Save current points? [Y/n]: ').strip().lower()
-            if ans in ('', 'y', 'yes'):
-                self._save()
+            # Auto-save with default names (no input() to avoid readline re-entry)
+            print('\n[topo] Window closed — auto-saving with default part names.')
+            self._do_save()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _toggle_mode(self):
+        if self.mode == 'SELECT':
+            self.mode = 'EDGE'
+            self._edge_first = None
+        else:
+            self.mode = 'SELECT'
+            self._edge_first = None
+        self._refresh()
+
+    def _find_nearest(self, mx: float, my: float) -> int | None:
+        """Return the index of the point closest to (mx, my), or None if too far."""
+        if not self.points:
+            return None
+        pts = np.array(self.points, dtype=np.float64)
+        dists = np.hypot(pts[:, 0] - mx, pts[:, 1] - my)
+        idx = int(np.argmin(dists))
+        if dists[idx] <= _SNAP_RADIUS:
+            return idx
+        return None
+
+    def _undo_last_point(self):
+        if not self.points:
+            return
+        removed_idx = len(self.points) - 1
+        self.points.pop()
+        self.node_parts.pop()
+        # remove any edges referencing the removed node
+        self.edges = [(a, b) for a, b in self.edges if a != removed_idx and b != removed_idx]
+        # cancel pending edge if it references removed node
+        if self._edge_first == removed_idx:
+            self._edge_first = None
+        self._refresh()
+
+    def _undo_edge(self):
+        if self._edge_first is not None:
+            self._edge_first = None           # just cancel pending
+        elif self.edges:
+            self.edges.pop()
+        self._refresh()
 
     # ── drawing ──────────────────────────────────────────────────────────────
 
@@ -166,97 +290,198 @@ class KeypointSelector:
         self._set_title()
         self.ax.axis('off')
 
+        # draw edges first (below nodes)
+        for (a, b) in self.edges:
+            xa, ya = self.points[a]
+            xb, yb = self.points[b]
+            is_inter = self.node_parts[a] != self.node_parts[b]
+            style = '--' if is_inter else '-'
+            colour = _EDGE_COLOUR_INTER if is_inter else _EDGE_COLOUR_INTRA
+            self.ax.plot([xa, xb], [ya, yb], style, color=colour,
+                         linewidth=1.5, alpha=0.8, zorder=3)
+
+        # draw nodes
         for idx, (x, y) in enumerate(self.points):
-            c = _colour(idx)
-            self.ax.scatter(x, y, s=120, c=c, zorder=5, linewidths=1.2, edgecolors='white')
-            label = self.names[idx] if idx < len(self.names) else f'kp{idx}'
+            pid = self.node_parts[idx]
+            c = _part_colour(pid)
+            marker_size = 140
+            edge_col = 'yellow' if (self._edge_first == idx) else 'white'
+            edge_w = 2.5 if (self._edge_first == idx) else 1.2
+            self.ax.scatter(x, y, s=marker_size, c=c, zorder=5,
+                            linewidths=edge_w, edgecolors=edge_col)
+            pname = self.part_names.get(pid, f'part_{pid}')
             self.ax.annotate(
-                f' {idx}: {label}',
+                f'{idx}:{pname}',
                 (x, y),
-                fontsize=8,
+                xytext=(12, 0),
+                textcoords='offset points',
+                fontsize=7,
                 color='white',
                 fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.2', fc=c, alpha=0.75, ec='none'),
+                va='center',
+                bbox=dict(boxstyle='round,pad=0.15', fc=c, alpha=0.75, ec='none'),
             )
 
-        # legend patch summary
-        if self.points:
-            patches = [
-                mpatches.Patch(
-                    color=_colour(i),
-                    label=f'{i}: {self.names[i] if i < len(self.names) else f"kp{i}"}  ({x}, {y})',
-                )
-                for i, (x, y) in enumerate(self.points)
-            ]
+        # legend — one entry per used Part
+        used_parts = sorted(set(self.node_parts))
+        if used_parts:
+            patches = []
+            for pid in used_parts:
+                count = self.node_parts.count(pid)
+                pname = self.part_names.get(pid, f'part_{pid}')
+                patches.append(mpatches.Patch(
+                    color=_part_colour(pid),
+                    label=f'{pname} ({count} pts)',
+                ))
             self.ax.legend(
-                handles=patches,
-                loc='upper right',
-                fontsize=7,
-                framealpha=0.8,
-                title=f'{len(self.points)} point(s)',
+                handles=patches, loc='upper right', fontsize=7,
+                framealpha=0.8, title=f'{len(self.points)} nodes  {len(self.edges)} edges',
                 title_fontsize=8,
             )
 
         self.fig.canvas.draw_idle()
 
-    # ── I/O ──────────────────────────────────────────────────────────────────
+    # ── save ─────────────────────────────────────────────────────────────────
 
-    def _save(self):
+    def _quick_save(self):
+        """Save immediately with current (default) part names."""
         if not self.points:
-            print('[select.py] No points selected — nothing saved.')
+            print('[topo] No points selected — nothing saved.')
+        else:
+            self._do_save()
+        self._saved = True          # prevent _on_close from re-saving
+        plt.close(self.fig)
+
+    def _named_save(self):
+        """Prompt for part names in terminal, then save."""
+        if not self.points:
+            print('[topo] No points selected — nothing saved.')
+            self._saved = True
+            plt.close(self.fig)
+            return
+
+        # prompt user to rename used Parts
+        used_parts = sorted(set(self.node_parts))
+        print('\n── Part naming ─────────────────────────────────────')
+        print('Press Enter to keep the default name, or type a new name.\n')
+        for pid in used_parts:
+            count = self.node_parts.count(pid)
+            default = self.part_names.get(pid, f'part_{pid}')
+            answer = input(f'  Part {pid} ({count} pts) [{default}]: ').strip()
+            if answer:
+                self.part_names[pid] = answer
+        print()
+
+        self._do_save()
+        self._saved = True          # prevent _on_close from re-saving
+        plt.close(self.fig)
+
+    def _do_save(self):
+        if not self.points:
             return
 
         stem = os.path.splitext(self.image_path)[0]
-        json_path = f'{stem}_kps.json'
-        png_path  = f'{stem}_kps.png'
+        npy_path = f'{stem}_topo.npy'
+        png_path = f'{stem}_topo.png'
 
-        # ── build JSON (SPair-compatible interface) ──────────────────────────
-        # Coordinates are integer pixel indices — exact for depth map lookup: depth[y, x]
-        kps_dict: dict[str, list[int] | None] = {}
-        for i, (x, y) in enumerate(self.points):
-            kps_dict[str(i)] = [int(x), int(y)]
+        N = len(self.points)
+        nodes = np.array(self.points, dtype=np.int32)                  # (N, 2)
+        node_parts = np.array(self.node_parts, dtype=np.int32)         # (N,)
 
-        payload = {
+        # build adjacency matrix: 0=no edge, 1=intra-part, 2=inter-part
+        adj_matrix = np.zeros((N, N), dtype=np.int32)
+        for (a, b) in self.edges:
+            val = 1 if node_parts[a] == node_parts[b] else 2
+            adj_matrix[a, b] = val
+            adj_matrix[b, a] = val
+
+        # only store Parts that are actually used
+        used_parts = sorted(set(self.node_parts))
+        part_names = {pid: self.part_names.get(pid, f'part_{pid}') for pid in used_parts}
+
+        data = {
+            'image_path':   self.image_path,
             'image_width':  self.img_w,
             'image_height': self.img_h,
-            'kps': kps_dict,
-            'keypoint_names': [
-                self.names[i] if i < len(self.names) else f'kp{i}'
-                for i in range(len(self.points))
-            ],
-            # [x, y, visibility=1]  —  x/y are integer pixel coords
-            'keypoints_xyv': [[int(x), int(y), 1] for x, y in self.points],
+            'nodes':        nodes,
+            'node_parts':   node_parts,
+            'part_names':   part_names,
+            'adj_matrix':   adj_matrix,
         }
 
-        with open(json_path, 'w') as f:
-            json.dump(payload, f, indent=2)
-        print(f'[select.py] Saved JSON  → {json_path}')
+        np.save(npy_path, data, allow_pickle=True)
+        print(f'[topo] Saved topology → {npy_path}')
 
         # ── save visualisation ───────────────────────────────────────────────
-        fig_save, ax_save = plt.subplots(
+        self._save_png(png_path, data)
+        print(f'[topo] Saved PNG      → {png_path}')
+
+        self._saved = True
+
+    def _save_png(self, png_path: str, data: dict):
+        fig, ax = plt.subplots(
             figsize=(max(6, self.img_w / 100), max(5, self.img_h / 100)),
             dpi=100,
         )
-        ax_save.imshow(np.array(self.img))
-        ax_save.axis('off')
-        for idx, (x, y) in enumerate(self.points):
-            c = _colour(idx)
-            ax_save.scatter(x, y, s=120, c=c, zorder=5, linewidths=1.2, edgecolors='white')
-            label = self.names[idx] if idx < len(self.names) else f'kp{idx}'
-            ax_save.annotate(
-                f' {idx}: {label}',
-                (x, y),
-                fontsize=8,
-                color='white',
-                fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.2', fc=c, alpha=0.75, ec='none'),
-            )
-        fig_save.tight_layout(pad=0)
-        fig_save.savefig(png_path, bbox_inches='tight', dpi=150)
-        plt.close(fig_save)
-        print(f'[select.py] Saved PNG   → {png_path}')
+        ax.imshow(np.array(self.img))
+        ax.axis('off')
 
-        self._saved = True
+        nodes = data['nodes']
+        nparts = data['node_parts']
+        adj = data['adj_matrix']
+        part_names = data['part_names']
+
+        # edges from adjacency matrix (upper triangle to avoid duplicates)
+        N = len(nodes)
+        for a in range(N):
+            for b in range(a + 1, N):
+                val = adj[a, b]
+                if val == 0:
+                    continue
+                xa, ya = nodes[a]
+                xb, yb = nodes[b]
+                is_inter = (val == 2)
+                style = '--' if is_inter else '-'
+                colour = _EDGE_COLOUR_INTER if is_inter else _EDGE_COLOUR_INTRA
+                ax.plot([xa, xb], [ya, yb], style, color=colour,
+                        linewidth=1.5, alpha=0.8, zorder=3)
+
+        # nodes
+        for idx in range(len(nodes)):
+            x, y = nodes[idx]
+            pid = nparts[idx]
+            c = _part_colour(pid)
+            ax.scatter(x, y, s=120, c=c, zorder=5, linewidths=1.2, edgecolors='white')
+            pname = part_names.get(pid, f'part_{pid}')
+            ax.annotate(
+                f'{idx}:{pname}',
+                (x, y),
+                xytext=(12, 0),
+                textcoords='offset points',
+                fontsize=7, color='white', fontweight='bold',
+                va='center',
+                bbox=dict(boxstyle='round,pad=0.15', fc=c, alpha=0.75, ec='none'),
+            )
+
+        # legend
+        n_intra = int(np.sum(adj == 1)) // 2  # symmetric → divide by 2
+        n_inter = int(np.sum(adj == 2)) // 2
+        n_edges = n_intra + n_inter
+        used = sorted(set(int(p) for p in nparts))
+        if used:
+            patches = [mpatches.Patch(
+                color=_part_colour(pid),
+                label=f'{part_names.get(pid, f"part_{pid}")} ({int(np.sum(nparts == pid))} pts)',
+            ) for pid in used]
+            ax.legend(
+                handles=patches, loc='upper right', fontsize=7, framealpha=0.8,
+                title=f'{N} nodes  {n_edges} edges (intra {n_intra} / inter {n_inter})',
+                title_fontsize=7,
+            )
+
+        fig.tight_layout(pad=0)
+        fig.savefig(png_path, bbox_inches='tight', dpi=150)
+        plt.close(fig)
 
     # ── entry ─────────────────────────────────────────────────────────────────
 
@@ -264,39 +489,25 @@ class KeypointSelector:
         plt.show()
 
 
-# ─── helper: load saved keypoints back as a torch tensor ────────────────────
-def load_keypoints(json_path: str):
-    """
-    Load saved keypoints and return a torch.Tensor of shape (N, 3) → [x, y, visibility=1],
-    compatible with utils.utils_correspondence.preprocess_kps_pad().
+# ─── load helper ─────────────────────────────────────────────────────────────
 
-    Example
-    -------
-    >>> kps = load_keypoints('data/images/antelope_kps.json')
-    >>> # kps shape: (N, 3)  — x, y in original image pixel space, visibility=1
+def load_topology(npy_path: str) -> dict:
     """
-    import torch
-    with open(json_path) as f:
-        data = json.load(f)
-    xyv = data.get('keypoints_xyv')
-    if xyv is None:
-        # fall back: reconstruct from 'kps' dict
-        kps_dict = data['kps']
-        n = len(kps_dict)
-        xyv = []
-        for i in range(n):
-            pt = kps_dict.get(str(i))
-            if pt is None:
-                xyv.append([0.0, 0.0, 0.0])
-            else:
-                xyv.append([pt[0], pt[1], 1.0])
-    return torch.tensor(xyv, dtype=torch.float32)
+    Load a saved topology .npy file and return the dict.
+
+    Keys: image_path, image_width, image_height,
+          nodes (N,2), node_parts (N,), part_names {id:str},
+          adj_matrix (N,N) — 0=no edge, 1=intra-part, 2=inter-part.
+    """
+    data = np.load(npy_path, allow_pickle=True).item()
+    return data
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Interactive keypoint selector for GeoAware-SC template images.',
+        description='Interactive topology keypoint selector.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -304,14 +515,14 @@ def main():
     args = parser.parse_args()
 
     if not os.path.isfile(args.image_path):
-        sys.exit(f'[select.py] ERROR: image not found: {args.image_path}')
+        sys.exit(f'[topo] ERROR: image not found: {args.image_path}')
 
-    print('[kp_select] Point selection order:')
-    print('  pt 0 -> Grasp  (grasping contact point)')
-    print('  pt 1 -> Func   (functional reference point)')
-    print('Select 2 points, then press Enter or Q to save.\n')
+    print('[topo] Topology selector')
+    print('  SELECT mode: left-click to add points, digit keys 0-9 to switch Part')
+    print('  EDGE   mode: Tab to enter, click two points to connect')
+    print('  Enter/Q: quick save  |  N: name parts & save  |  Esc: cancel\n')
 
-    selector = KeypointSelector(image_path=args.image_path)
+    selector = TopologySelector(image_path=args.image_path)
     selector.run()
 
 
