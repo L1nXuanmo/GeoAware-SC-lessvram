@@ -8,10 +8,10 @@ Usage
 -----
     python keypoints/kp_match.py \\
         --src  data/images/bowl.jpg \\
-        --kps  data/images/bowl_kps.json \\
+        --kps  data/images/bowl_topo.npy \\
         --tgt  data/images/target.jpg \\
         [--ckpt results_spair/best_856.PTH] \\
-        [--out  results/match_result.json] \\
+        [--out  results/match_result.npy] \\
         [--no-vis] \\
         [--fp16] \\
         [--sd-size 960]
@@ -40,24 +40,20 @@ Recommended presets
 
 Output
 ------
-  <out>.json   — matched keypoint coords in target image space
+  <out>.npy    — matched keypoint topology dict (np.load(..., allow_pickle=True).item())
   <out>.png    — side-by-side visualisation (optional)
 
-JSON output format
-------------------
-{
-  "src_image":  "...",
-  "tgt_image":  "...",
-  "matches": [
-    {
-      "id": 0,
-      "name": "Grasp",
-      "src_xy": [428, 234],        # original-space pixel in source
-      "tgt_xy": [512, 310]         # original-space pixel in target
-    },
-    ...
-  ]
-}
+.npy dict structure
+-------------------
+  {
+      "src_image":    str,              # source image absolute path
+      "src_nodes":    np.ndarray,       # (N, 2) int32  — source [x, y] pixel coords
+      "tgt_image":    str,              # target image absolute path
+      "tgt_nodes":    np.ndarray,       # (N, 2) int32  — matched target [x, y] pixel coords
+      "node_parts":   np.ndarray,       # (N,)   int32  — Part ID per node
+      "part_names":   dict,             # {int: str}     e.g. {0: "handle", 2: "rim"}
+      "adj_matrix":   np.ndarray,       # (N, N) int32  — 0=no edge, 1=intra, 2=inter
+  }
 
 Memory strategy
 ---------------
@@ -70,7 +66,6 @@ Memory strategy
 
 import argparse
 import gc
-import json
 import os
 import sys
 import threading
@@ -330,16 +325,21 @@ def match(src_path: str,
     src_w, src_h = src_img.size
     tgt_w, tgt_h = tgt_img.size
 
-    # ── load keypoints ───────────────────────────────────────────────────────
-    with open(kps_path) as f:
-        kps_data = json.load(f)
+    # ── load topology keypoints (.npy from kp_select.py) ────────────────────
+    topo       = np.load(kps_path, allow_pickle=True).item()
+    nodes      = topo['nodes']        # (N, 2) int32 — [x, y] pixel coords
+    node_parts = topo['node_parts']   # (N,) int32
+    part_names = topo['part_names']   # {int: str}
 
     kps_raw: list[dict] = []
-    for i, xyv in enumerate(kps_data['keypoints_xyv']):
+    for i in range(len(nodes)):
+        pid = int(node_parts[i])
+        pname = part_names.get(pid, f'part_{pid}')
         kps_raw.append({
             'id': i,
-            'name': kps_data.get('keypoint_names', ['kp'])[i] if i < len(kps_data.get('keypoint_names', [])) else f'kp{i}',
-            'src_xy': (int(xyv[0]), int(xyv[1])),
+            'name': pname,
+            'part_id': pid,
+            'src_xy': (int(nodes[i][0]), int(nodes[i][1])),
         })
 
     # map source KPs to padded-square space for feature lookup
@@ -355,7 +355,7 @@ def match(src_path: str,
         projection_dim=768,
         device=device,
     )
-    aggre_net.load_pretrained_weights(torch.load(ckpt_path, map_location=device))
+    aggre_net.load_pretrained_weights(torch.load(ckpt_path, map_location=device, weights_only=False))
     aggre_net.eval()
 
     # ── load backbone models ─────────────────────────────────────────────────
@@ -397,42 +397,43 @@ def match(src_path: str,
     torch.cuda.empty_cache()
 
     # ── map target KPs back to original image space ──────────────────────────
-    matches = []
+    src_nodes_list = []
+    tgt_nodes_list = []
     for kp, tgt_pad in zip(kps_raw, tgt_kps_padded):
         tgt_orig = padded_to_orig(tgt_pad, tgt_w, tgt_h, IMG_SIZE)
-        matches.append({
-            'id':     kp['id'],
-            'name':   kp['name'],
-            'src_xy': list(kp['src_xy']),
-            'tgt_xy': list(tgt_orig),
-        })
+        src_nodes_list.append(kp['src_xy'])
+        tgt_nodes_list.append(tgt_orig)
         print(f'  [{kp["id"]}] {kp["name"]:10s}  src={kp["src_xy"]}  →  tgt={tgt_orig}')
 
     result = {
-        'src_image': os.path.abspath(src_path),
-        'tgt_image': os.path.abspath(tgt_path),
-        'matches':   matches,
+        'src_image':   os.path.abspath(src_path),
+        'src_nodes':   np.array(src_nodes_list, dtype=np.int32),   # (N, 2)
+        'tgt_image':   os.path.abspath(tgt_path),
+        'tgt_nodes':   np.array(tgt_nodes_list, dtype=np.int32),   # (N, 2)
+        'node_parts':  topo['node_parts'],                         # (N,) int32
+        'part_names':  topo['part_names'],                         # {int: str}
+        'adj_matrix':  topo['adj_matrix'],                         # (N, N) int32
     }
 
-    # ── save JSON ─────────────────────────────────────────────────────────────
+    # ── save .npy ─────────────────────────────────────────────────────────────
     if out_path is None:
         stem = os.path.splitext(tgt_path)[0]
-        out_path = f'{stem}_match.json'
+        out_path = f'{stem}_match.npy'
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    print(f'[kp_match] Saved JSON → {out_path}')
+    np.save(out_path, result, allow_pickle=True)
+    print(f'[kp_match] Saved .npy → {out_path}')
 
     # ── save visualisation ────────────────────────────────────────────────────
     if save_vis_flag:
         vis_path = os.path.splitext(out_path)[0] + '_vis.png'
         src_img_disp = resize(src_img, target_res=IMG_SIZE, resize=True, to_pil=True)
         tgt_img_disp = resize(tgt_img, target_res=IMG_SIZE, resize=True, to_pil=True)
+        names = [kp['name'] for kp in kps_raw]
         save_vis(
             src_img_disp, tgt_img_disp,
             src_kps_padded, tgt_kps_padded,
-            [m['name'] for m in matches],
+            names,
             vis_path,
         )
 
@@ -448,10 +449,10 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument('--src',   required=True, help='Source image path')
-    parser.add_argument('--kps',   required=True, help='Source keypoints JSON (from kp_select.py)')
+    parser.add_argument('--kps',   required=True, help='Source topology .npy file (from kp_select.py)')
     parser.add_argument('--tgt',   required=True, help='Target image path')
     parser.add_argument('--ckpt',  default=DEFAULT_CKPT, help='AggregationNetwork checkpoint (.PTH)')
-    parser.add_argument('--out',   default=None,  help='Output JSON path (default: <tgt_stem>_match.json)')
+    parser.add_argument('--out',   default=None,  help='Output .npy path (default: <tgt_stem>_match.npy)')
     parser.add_argument('--no-vis', action='store_true', help='Skip saving visualisation PNG')
     parser.add_argument('--fp16', action='store_true',
                         help='Use FP16 (half-precision) for SD + DINOv2. '

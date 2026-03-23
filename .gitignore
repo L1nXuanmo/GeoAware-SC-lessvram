@@ -6,6 +6,8 @@ __pycache__
 *.npy
 *.pth
 *.PTH
+# allow the pretrained checkpoint
+!results_spair/best_856.PTH
 *.zip
 *.log
 zip*

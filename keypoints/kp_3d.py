@@ -2,7 +2,7 @@
 keypoints/kp_3d.py — Lift 2-D keypoints to 3-D using an RGBD image pair.
 
 Given:
-  * a keypoint JSON file (color_kps.json format, produced by kp_select.py)
+  * a topology .npy file (produced by kp_select.py)
   * an RGB image
   * a depth image  (16-bit PNG in millimetres, .npy, or 32-bit .exr in metres)
 
@@ -10,8 +10,8 @@ This script:
   1. Reconstructs a dense 3-D point cloud from the RGBD pair.
   2. Back-projects each 2-D keypoint through the depth map → (X, Y, Z) in
      camera frame (metres).
-  3. Saves the 3-D coordinates back into the same JSON file under two new
-     keys: "kps_3d" and "keypoints_xyzv".
+  3. Saves the 3-D coordinates back into the same .npy file under a new
+     key: "nodes_3d".
   4. Opens an interactive Open3D viewer showing the coloured point cloud
      with the keypoints rendered as labelled spheres.
 
@@ -19,7 +19,7 @@ Usage
 -----
     # Recommended: pass intrinsics file (3×3 .npy matrix)
     python keypoints/kp_3d.py \\
-        --kps   path/to/color_kps.json \\
+        --kps   path/to/template_topo.npy \\
         --rgb   path/to/color.png \\
         --depth path/to/depth.png \\
         --intr  path/to/cam_intr.npy \\
@@ -30,7 +30,7 @@ Usage
 
     # Or: specify intrinsics manually (fallback if no --intr)
     python keypoints/kp_3d.py \\
-        --kps   path/to/color_kps.json \\
+        --kps   path/to/template_topo.npy \\
         --rgb   path/to/color.png \\
         --depth path/to/depth.png \\
         --fx 636.3 --fy 636.3 --cx 640 --cy 360
@@ -56,16 +56,8 @@ Depth encoding (--depth-scale)
 JSON output (written in-place to the --kps file)
 ------------------------------------------------
   {
-    ...original keys...
-    "kps_3d": {
-      "0": [X, Y, Z],           # metres, camera frame — null if no valid depth
-      "1": [X, Y, Z],
-      ...
-    },
-    "keypoints_xyzv": [
-      [X, Y, Z, visibility],    # visibility mirrors the original keypoints_xyv
-      ...
-    ],
+    ...original topology keys...
+    "nodes_3d": np.ndarray,      # (N, 3) float64 — [X,Y,Z] metres (NaN if invalid)
     "camera_intrinsics": {
       "fx": ..., "fy": ..., "cx": ..., "cy": ...,
       "depth_scale": ...
@@ -81,7 +73,6 @@ Viewer controls
 """
 
 import argparse
-import json
 import os
 import sys
 
@@ -189,7 +180,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--kps",   required=True,
-                        help="Path to keypoint JSON  (color_kps.json format)")
+                        help="Path to topology .npy file  (from kp_select.py)")
     parser.add_argument("--rgb",   required=True,
                         help="Path to RGB image  (PNG / JPG)")
     parser.add_argument("--depth", required=True,
@@ -235,9 +226,8 @@ def main() -> None:
                   "--fx/--fy/--cx/--cy manually.")
 
     # ── load inputs ──────────────────────────────────────────────────────────
-    print(f"Loading keypoints : {args.kps}")
-    with open(args.kps, "r") as f:
-        kps_data = json.load(f)
+    print(f"Loading topology  : {args.kps}")
+    topo = np.load(args.kps, allow_pickle=True).item()
 
     print(f"Loading RGB       : {args.rgb}")
     rgb_img = np.array(Image.open(args.rgb).convert("RGB"))
@@ -253,49 +243,41 @@ def main() -> None:
               "dimensions differ — proceeding with depth dimensions")
 
     # ── back-project each keypoint to 3-D ────────────────────────────────────
-    kps_2d      = kps_data["kps"]                # {"0": [u,v], "1": [u,v], ...}
-    names_list  = kps_data.get("keypoint_names") or []
-    vis_flags   = {                              # from keypoints_xyv if present
-        str(i): v
-        for i, (_, _, v) in enumerate(kps_data.get("keypoints_xyv", []))
-    }
+    nodes       = topo["nodes"]        # (N, 2) int32 — [x, y]
+    node_parts  = topo["node_parts"]   # (N,) int32
+    part_names  = topo["part_names"]   # {int: str}
+    N_kp        = len(nodes)
 
-    kps_3d      : dict[str, list | None] = {}
-    kps_xyzv    : list = []
+    nodes_3d = np.full((N_kp, 3), np.nan, dtype=np.float64)
 
     print("\n── Keypoint back-projection ─────────────────────────────────────")
-    for key, (u, v) in kps_2d.items():
-        u_i = max(0, min(w_d - 1, int(round(u))))
-        v_i = max(0, min(h_d - 1, int(round(v))))
+    for i in range(N_kp):
+        u, v = int(nodes[i][0]), int(nodes[i][1])
+        u_i = max(0, min(w_d - 1, u))
+        v_i = max(0, min(h_d - 1, v))
         d   = float(depth_m[v_i, u_i])
-        vis = vis_flags.get(key, 1)
 
-        idx  = int(key)
-        name = names_list[idx] if idx < len(names_list) else f"kp{key}"
+        pid  = int(node_parts[i])
+        name = part_names.get(pid, f"part_{pid}")
 
         if d <= 0 or d >= args.depth_max:
-            print(f"  [{key}] {name:<12s}  pixel=({u_i},{v_i})  "
+            print(f"  [{i}] {name:<12s}  pixel=({u_i},{v_i})  "
                   f"depth={d:.4f} m  → INVALID (no 3-D point)")
-            kps_3d[key] = None
-            kps_xyzv.append([None, None, None, 0])
             continue
 
         xyz = backproject(u_i, v_i, d, fx, fy, cx, cy)
-        kps_3d[key] = xyz.tolist()
-        kps_xyzv.append([float(xyz[0]), float(xyz[1]), float(xyz[2]), int(vis)])
-        print(f"  [{key}] {name:<12s}  pixel=({u_i},{v_i})  depth={d:.4f} m"
+        nodes_3d[i] = xyz
+        print(f"  [{i}] {name:<12s}  pixel=({u_i},{v_i})  depth={d:.4f} m"
               f"  → X={xyz[0]:+.4f}  Y={xyz[1]:+.4f}  Z={xyz[2]:+.4f}")
 
-    # ── save back to JSON ─────────────────────────────────────────────────────
+    # ── save back to topology .npy ────────────────────────────────────
     if not args.no_save:
-        kps_data["kps_3d"]          = kps_3d
-        kps_data["keypoints_xyzv"]  = kps_xyzv
-        kps_data["camera_intrinsics"] = {
+        topo["nodes_3d"] = nodes_3d            # (N, 3) float64, NaN = invalid
+        topo["camera_intrinsics"] = {
             "fx": fx, "fy": fy, "cx": cx, "cy": cy,
             "depth_scale": args.depth_scale,
         }
-        with open(args.kps, "w") as f:
-            json.dump(kps_data, f, indent=2)
+        np.save(args.kps, topo, allow_pickle=True)
         print(f"\n[saved] 3-D keypoints written to  {args.kps}")
 
     # ── 3-D visualisation ────────────────────────────────────────────────────
@@ -318,9 +300,10 @@ def main() -> None:
     print(f"  after voxel downsample (size={voxel:.3f} m) : {len(pcd.points):,}")
 
     # determine sphere radius relative to scene depth
-    valid_xyz = [v for v in kps_3d.values() if v is not None]
-    if valid_xyz:
-        mean_z    = np.mean([v[2] for v in valid_xyz])
+    valid_mask = ~np.isnan(nodes_3d[:, 0])
+    valid_xyz  = nodes_3d[valid_mask]
+    if len(valid_xyz) > 0:
+        mean_z    = np.mean(valid_xyz[:, 2])
         sphere_r  = max(0.005, mean_z * 0.012)
     else:
         sphere_r  = 0.01
@@ -329,16 +312,16 @@ def main() -> None:
     geoms: list = [pcd]
 
     print("\n── Keypoint spheres ─────────────────────────────────────────────")
-    for key, xyz in kps_3d.items():
-        if xyz is None:
+    for i in range(N_kp):
+        if np.isnan(nodes_3d[i, 0]):
             continue
-        idx    = int(key)
-        colour = _sphere_colour(idx)
-        name   = names_list[idx] if idx < len(names_list) else f"kp{key}"
-        sphere = make_sphere(np.array(xyz), sphere_r, colour)
+        pid    = int(node_parts[i])
+        colour = _sphere_colour(pid)
+        name   = part_names.get(pid, f"part_{pid}")
+        sphere = make_sphere(nodes_3d[i], sphere_r, colour)
         geoms.append(sphere)
-        print(f"  sphere [{key}] {name:<12s}  colour={colour}  "
-              f"pos=[{xyz[0]:+.4f}, {xyz[1]:+.4f}, {xyz[2]:+.4f}]")
+        print(f"  sphere [{i}] {name:<12s}  colour={colour}  "
+              f"pos=[{nodes_3d[i,0]:+.4f}, {nodes_3d[i,1]:+.4f}, {nodes_3d[i,2]:+.4f}]")
 
     # coordinate frame at origin
     frame_size = sphere_r * 8
