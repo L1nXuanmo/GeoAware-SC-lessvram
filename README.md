@@ -37,19 +37,78 @@ Please cite the original paper/repository for research use.
 
 ### Environment
 
-> Recommended: use `mamba run -n <env> ...` instead of `conda activate` on systems where shell init is not loaded.
+> `mamba` and `conda` (≥ 23.10 with libmamba solver) are interchangeable below.
+> Use `mamba run` / `conda run` instead of `conda activate` on systems where
+> shell init is not loaded.
 
 ```bash
-mamba create -n geo-aware-5090 python=3.10 -y
+# ── 1. Create env ──────────────────────────────────────────────
+conda create -n geo-aware-5090 python=3.10 -y
 
-# Install PyTorch CUDA 12.8
-mamba run -n geo-aware-5090 pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+# ── 2. Install PyTorch CUDA 12.8 ──────────────────────────────
+conda run -n geo-aware-5090 pip install \
+  torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu128
 
-# Install this fork and local third_party deps
-mamba run -n geo-aware-5090 pip install -e . --no-deps
-mamba run -n geo-aware-5090 pip install -e third_party/Mask2Former --no-deps
-mamba run -n geo-aware-5090 pip install -e third_party/ODISE --no-deps
+# ── 3. Install conda-side CUDA toolkit (for C++ extension compilation) ──
+#    Required when the system-wide CUDA version differs from 12.8.
+conda install -n geo-aware-5090 \
+  -c nvidia/label/cuda-12.8.0 cuda-nvcc=12.8 cuda-cudart-dev=12.8 \
+  cuda-libraries-dev=12.8 -y
+
+# ── 4. Install this fork + third_party deps ───────────────────
+#    IMPORTANT: --no-build-isolation is required because setup.py
+#    does `import torch` at the top level.
+#    CUDA_HOME must point to the conda env so nvcc 12.8 is used.
+export CUDA_HOME=$CONDA_PREFIX   # or /path/to/miniconda3/envs/geo-aware-5090
+
+conda run -n geo-aware-5090 pip install -e . --no-deps --no-build-isolation
+CUDA_HOME=$CUDA_HOME conda run -n geo-aware-5090 pip install \
+  -e third_party/Mask2Former --no-deps --no-build-isolation
+CUDA_HOME=$CUDA_HOME conda run -n geo-aware-5090 pip install \
+  -e third_party/ODISE --no-deps --no-build-isolation
+
+# ── 5. Install runtime dependencies ──────────────────────────
+conda run -n geo-aware-5090 pip install \
+  "loguru>=0.5.3" "faiss-cpu==1.7.1.post3" "matplotlib>=3.4.2" \
+  "tqdm>=4.61.2" "numpy>=1.23" "pillow>=9.5.0" "ipykernel==6.29.5" \
+  "gdown>=4.6.0" "wandb>=0.16.0" "pytorch-lightning>=1.8" "torchmetrics>=0.9"
+
+# ── 6. Install ODISE runtime dependencies ─────────────────────
+conda run -n geo-aware-5090 pip install \
+  diffdist==0.1 "einops>=0.3.0" "nltk>=3.6.2" omegaconf==2.1.1 \
+  open-clip-torch==2.0.2 opencv-python stable-diffusion-sdkit==2.1.3 timm==0.6.11
+
+# ── 7. Install detectron2 (needs CUDA_HOME) ──────────────────
+CUDA_HOME=$CUDA_HOME conda run -n geo-aware-5090 pip install \
+  "detectron2 @ https://github.com/facebookresearch/detectron2/archive/v0.6.zip" \
+  --no-build-isolation
+
+# ── 8. Post-install fixes ─────────────────────────────────────
+# 8a) sdkit downgrades pytorch-lightning & torchmetrics — force them back
+conda run -n geo-aware-5090 pip install \
+  "pytorch-lightning>=1.8" "torchmetrics>=0.9" --force-reinstall --no-deps
+
+# 8b) opencv-python 4.6 is numpy-1.x only; upgrade to numpy-2.x-compatible
+conda run -n geo-aware-5090 pip install --upgrade opencv-python opencv-python-headless
+
+# 8c) Patch fvcore for PyTorch weights_only default change
+#     In  <env>/lib/python3.10/site-packages/fvcore/common/checkpoint.py
+#     change:  torch.load(f, map_location=torch.device("cpu"))
+#     to:      torch.load(f, map_location=torch.device("cpu"), weights_only=False)
+
+# 8d) Patch detectron2 for Pillow ≥ 10  (only needed for v0.6 tag)
+#     In  <env>/lib/python3.10/site-packages/detectron2/data/transforms/transform.py
+#     change:  interp=Image.LINEAR
+#     to:      interp=Image.BILINEAR
 ```
+
+> **Note on Mask2Former CUDA source patch:**
+> The file `third_party/Mask2Former/.../ms_deform_attn_cuda.cu` has already been
+> patched in this repo (`value.type()` → `value.scalar_type()`,
+> `.type().is_cuda()` → `.is_cuda()`). If you are starting from a fresh
+> upstream clone, you will need to apply these changes manually — see
+> `setup.py` comment block [D-4] for details.
 
 ### Run matching
 

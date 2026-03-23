@@ -36,14 +36,41 @@ assert torch_ver >= [1, 8], "Requires PyTorch >= 1.8"
 #
 # [D] Manual compatibility patches required in this repository/environment
 # (recorded here for reproducibility)
-# - third_party/ODISE/odise/model_zoo/model_zoo.py:
-#     replaced pkg_resources resource lookup with os.path-based lookup.
-# - third_party/ODISE/odise/modeling/meta_arch/ldm.py:
-#     updated dtype handling for FP16 path and modern lightning import path.
-# - environment site-packages patch (runtime-level):
-#     fvcore/common/checkpoint.py torch.load(..., weights_only=False) for
-#     checkpoints serialized with objects not allowed by default in newer
-#     PyTorch weights_only mode.
+#
+# D-1  third_party/ODISE/odise/model_zoo/model_zoo.py:
+#        replaced pkg_resources resource lookup with os.path-based lookup.
+# D-2  third_party/ODISE/odise/modeling/meta_arch/ldm.py:
+#        updated dtype handling for FP16 path and modern lightning import path.
+# D-3  environment site-packages patch (runtime-level):
+#        fvcore/common/checkpoint.py  →  torch.load(..., weights_only=False)
+#        for checkpoints serialized with objects not allowed by default in
+#        newer PyTorch weights_only mode.
+# D-4  third_party/Mask2Former  ms_deform_attn_cuda.cu  (PyTorch ≥ 2.7):
+#        - AT_DISPATCH_FLOATING_TYPES(value.type(), ...)  →  value.scalar_type()
+#        - value.type().is_cuda()  →  value.is_cuda()   (forward + backward,
+#          6 occurrences total). Without this patch nvcc fails with
+#          "no suitable conversion from DeprecatedTypeProperties to ScalarType".
+# D-5  detectron2 v0.6  data/transforms/transform.py:
+#        Image.LINEAR  →  Image.BILINEAR   (Pillow ≥ 10 removed LINEAR).
+#        NOTE: only the *release tag v0.6* needs this; detectron2 main branch
+#        already ships the fix, but we pin v0.6 for reproducibility.
+# D-6  opencv-python version:
+#        ODISE pins opencv-python==4.6.0.66, which is compiled against
+#        numpy 1.x ABI and crashes on numpy 2.x. After installing ODISE deps,
+#        upgrade: pip install --upgrade opencv-python opencv-python-headless
+# D-7  stable-diffusion-sdkit downgrades pytorch-lightning & torchmetrics:
+#        After installing ODISE deps (which pulls in sdkit), force-reinstall:
+#        pip install "pytorch-lightning>=1.8" "torchmetrics>=0.9" \
+#            --force-reinstall --no-deps
+#
+# [D-install] IMPORTANT pip install flags:
+#   All three `pip install -e` commands (this repo, Mask2Former, ODISE) MUST
+#   use  --no-build-isolation  because setup.py does `import torch` at the
+#   top level, and pip's isolated build env does not contain torch.
+#   Mask2Former and detectron2 compile CUDA C++ extensions, so you also need:
+#     export CUDA_HOME=<conda-env-prefix>   (e.g. $CONDA_PREFIX)
+#   to ensure nvcc matches the PyTorch CUDA version (12.8), especially when
+#   the system-wide CUDA is a different version.
 #
 # [E] xformers note
 # - xformers is NOT pinned here on purpose. Across torch/cuda/gpu-arch combos,
