@@ -1,67 +1,35 @@
 """
-keypoints/kp_match.py — Semantic keypoint matching using GeoAware-SC backbone.
+keypoints/kp_match.py — Topology-aware semantic keypoint matching (GeoAware-SC).
 
-Given a source image with pre-selected keypoints and a target image,
-finds the semantically corresponding pixel locations on the target.
+Given a source image with topology keypoints and a target image, finds the
+semantically corresponding pixel locations on the target using a two-stage
+pipeline:
+  Stage 1 — Top-K candidates + topology neighbour re-ranking (scale-invariant)
+  Stage 2 — Up-sampled local refinement (60→240, precision ~8px → ~2px)
 
 Usage
 -----
     python keypoints/kp_match.py \\
-        --src  data/images/bowl.jpg \\
-        --kps  data/images/bowl_topo.npy \\
-        --tgt  data/images/target.jpg \\
+        --src  <source.png> \\
+        --kps  <source_topo.npy> \\
+        --tgt  <target.png> \\
         [--ckpt results_spair/best_856.PTH] \\
-        [--out  results/match_result.npy] \\
-        [--no-vis] \\
-        [--fp16] \\
-        [--sd-size 960]
+        [--out  result.npy] [--no-vis] \\
+        [--fp16] [--sd-size 960] \\
+        [--top-k 8] [--alpha 0.7] [--refine 4]
 
-Recommended presets
--------------------
-  * 24GB+ GPU:
-      python keypoints/kp_match.py ...
-  * 12GB GPU (e.g. RTX 3080Ti / RTX 4070):
-      python keypoints/kp_match.py ... --fp16
-  * If still OOM on 12GB cards:
-      python keypoints/kp_match.py ... --fp16 --sd-size 768
-      python keypoints/kp_match.py ... --fp16 --sd-size 640
-      python keypoints/kp_match.py ... --fp16 --sd-size 512
+Key options
+-----------
+  --fp16          FP16 backbone (~5 GB vs ~10 GB VRAM)
+  --sd-size N     SD input resolution (960/768/640/512, multiples of 64)
+  --top-k K       Stage-1 candidate count (1 = legacy argmax, default 8)
+  --alpha A       Appearance vs geometry weight (1.0 = appearance only, default 0.7)
+  --refine R      Feature upsample factor for Stage-2 (0 = skip, default 4)
 
-`--sd-size` meaning and impact
-------------------------------
-  * Controls SD backbone input resolution before feature extraction.
-  * Default is 960 (because NUM_PATCHES=60, and 60*16=960).
-  * Smaller values reduce memory/compute in SD forward, but may reduce matching quality.
-  * Typical values:
-      - 960: best quality, highest cost
-      - 768: good balance
-      - 640/512: lowest cost, quality may drop on fine details
-  * Keep it as multiples of 64 for stable behavior.
-
-Output
+Output  <out>.npy + <out>_vis.png
 ------
-  <out>.npy    — matched keypoint topology dict (np.load(..., allow_pickle=True).item())
-  <out>.png    — side-by-side visualisation (optional)
-
-.npy dict structure
--------------------
-  {
-      "src_image":    str,              # source image absolute path
-      "src_nodes":    np.ndarray,       # (N, 2) int32  — source [x, y] pixel coords
-      "tgt_image":    str,              # target image absolute path
-      "tgt_nodes":    np.ndarray,       # (N, 2) int32  — matched target [x, y] pixel coords
-      "node_parts":   np.ndarray,       # (N,)   int32  — Part ID per node
-      "part_names":   dict,             # {int: str}     e.g. {0: "handle", 2: "rim"}
-      "adj_matrix":   np.ndarray,       # (N, N) int32  — 0=no edge, 1=intra, 2=inter
-  }
-
-Memory strategy
----------------
-* SD model and DINOv2 model are loaded once, used for both images, then
-  deleted and CUDA cache cleared before running correspondence.
-* All intermediate tensors are explicitly deleted after use.
-* Cosine-similarity map is computed on GPU but immediately moved to CPU.
-* Final descriptors (1×768×60×60 ≈ 11 MB each) are kept on CPU between steps.
+  .npy dict: src_image, src_nodes (N,2), tgt_image, tgt_nodes (N,2),
+             node_parts (N,), part_names {id:str}, adj_matrix (N,N)
 """
 
 import argparse
@@ -92,14 +60,13 @@ if torch.cuda.is_available():
 # ── STEP 3: now safe to import project modules that touch CUDA/detectron2 ────
 import numpy as np
 from PIL import Image
-from types import SimpleNamespace
 
 # ── project root on path ──────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from utils.utils_correspondence import resize, kpts_to_patch_idx, calculate_keypoint_transformation
+from utils.utils_correspondence import resize
 from model_utils.extractor_sd import load_model, process_features_and_mask
 from model_utils.extractor_dino import ViTExtractor
 from model_utils.projection_network import AggregationNetwork
@@ -227,31 +194,211 @@ def padded_to_orig(xy, orig_w, orig_h, target_res=IMG_SIZE):
 def find_correspondences(feat_src: torch.Tensor,
                          feat_tgt: torch.Tensor,
                          src_kps_padded: list[tuple[int, int]],
+                         adj_matrix: np.ndarray | None = None,
+                         nodes_3d: np.ndarray | None = None,
+                         node_parts: np.ndarray | None = None,
                          img_size: int = IMG_SIZE,
-                         num_patches: int = NUM_PATCHES) -> list[tuple[int, int]]:
+                         num_patches: int = NUM_PATCHES,
+                         top_k: int = 8,
+                         alpha: float = 0.7,
+                         sigma: float = 0.3,
+                         depth_weight: float = 0.15,
+                         refine_factor: int = 4,
+                         refine_window: int = 16) -> list[tuple[int, int]]:
     """
-    For each source keypoint (x,y) in padded-space, find the best-matching
-    pixel in target padded-space.
+    Two-stage keypoint matching with topology-aware refinement.
 
-    Uses kpts_to_patch_idx + calculate_keypoint_transformation from
-    utils/utils_correspondence.py (the same functions used in pck_train.py).
+    Stage 1 — Top-K + topology neighbour consistency + 3D depth constraint:
+      For each source keypoint, keep the K highest-cosine candidates in the
+      target patch grid.  When *adj_matrix* is provided, re-rank candidates
+      using a combined score:
+          final(c) = α · sim(c) + (1-α-β) · geo_score(c) + β · depth_score(c)
+      where geo_score penalises ratio deviations of edge lengths (scale-invariant),
+      and depth_score penalises candidates that break the same-Part height ordering
+      from source 3D coordinates (requires nodes_3d).
 
-    feat_src / feat_tgt: CUDA tensors (1, 768, num_patches, num_patches)
-    Returns: list of (x, y) in target padded-space (img_size pixels).
+    Stage 2 — Up-sampled refinement (unchanged).
+
+    Parameters
+    ----------
+    nodes_3d       : (N, 3) float64 from kp_select (NaN for invalid). None to skip.
+    node_parts     : (N,) int32 Part IDs. Needed for same-Part 3D constraint.
+    depth_weight   : weight β for 3D depth constraint (default 0.15).
+                     geo weight becomes (1 - α - β). Set 0 to disable.
+
+    Returns
+    -------
+    list of (x, y) in target padded-space (img_size pixels).
     """
-    # reshape spatial map (1, C, P, P) → patch list (1, P*P, C)
-    desc1 = feat_src.reshape(1, -1, num_patches ** 2).permute(0, 2, 1)  # (1, 3600, 768)
-    desc2 = feat_tgt.reshape(1, -1, num_patches ** 2).permute(0, 2, 1)
+    P  = num_patches                     # 60
+    PP = P * P                           # 3600
+    stride = img_size / P                # 8.0
 
-    # kpts_to_patch_idx expects a torch FloatTensor (N, ≥2) with col-0=x col-1=y in ANNO_SIZE space
-    kps_tensor = torch.tensor([[x, y, 1] for x, y in src_kps_padded], dtype=torch.float32)
-    args = SimpleNamespace(ANNO_SIZE=img_size, SOFT_EVAL=False)
-    patch_idx = kpts_to_patch_idx(args, kps_tensor, num_patches)  # (N,) int patch indices
+    # ── similarity matrix (P*P × P*P) ────────────────────────────────────────
+    desc1 = feat_src.reshape(1, -1, PP).permute(0, 2, 1)   # (1, 3600, C)
+    desc2 = feat_tgt.reshape(1, -1, PP).permute(0, 2, 1)
+    sim = torch.matmul(desc1, desc2.permute(0, 2, 1))[0]   # (3600, 3600)
 
-    # calculate_keypoint_transformation returns (N, 2) tensor: (x, y) in ANNO_SIZE pixels
-    kps_1_to_2 = calculate_keypoint_transformation(args, desc1, desc2, patch_idx, num_patches)
+    # source keypoints → patch indices
+    kps_arr = np.array(src_kps_padded, dtype=np.float32)    # (N, 2) [x, y]
+    src_patch_x = np.clip((P / img_size * kps_arr[:, 0]).astype(np.int32), 0, P - 1)
+    src_patch_y = np.clip((P / img_size * kps_arr[:, 1]).astype(np.int32), 0, P - 1)
+    patch_idx   = P * src_patch_y + src_patch_x              # (N,)
+    N = len(patch_idx)
 
-    return [(int(k[0].item()), int(k[1].item())) for k in kps_1_to_2]
+    sim_indexed = sim[patch_idx]                              # (N, 3600)
+
+    # ── Stage 1a: Top-K candidates ───────────────────────────────────────────
+    K = min(top_k, PP)
+    topk_vals, topk_ids = torch.topk(sim_indexed, K, dim=-1)  # (N, K)
+
+    # convert top-k patch indices → pixel coords  (patch centre)
+    topk_py = topk_ids // P           # (N, K) row in patch grid
+    topk_px = topk_ids %  P           # (N, K) col
+    topk_x  = (topk_px.float() * stride + stride / 2)  # (N, K) pixel x
+    topk_y  = (topk_py.float() * stride + stride / 2)  # (N, K) pixel y
+
+    # ── Stage 1b: Topology-aware re-ranking ──────────────────────────────────
+    if adj_matrix is not None and N > 1:
+        # first-pass argmax positions (used as neighbour anchors)
+        argmax_ids = torch.argmax(sim_indexed, dim=-1)        # (N,)
+        anchor_x = (argmax_ids % P).float() * stride + stride / 2   # (N,)
+        anchor_y = (argmax_ids // P).float() * stride + stride / 2
+
+        # source keypoint positions as tensor
+        src_x = torch.tensor([p[0] for p in src_kps_padded], dtype=torch.float32)
+        src_y = torch.tensor([p[1] for p in src_kps_padded], dtype=torch.float32)
+
+        adj = torch.from_numpy((adj_matrix > 0).astype(np.float32))  # (N, N)
+
+        # normalise sim scores to [0, 1] per keypoint for blending
+        sim_norm = topk_vals - topk_vals.min(dim=-1, keepdim=True).values
+        denom = topk_vals.max(dim=-1, keepdim=True).values - topk_vals.min(dim=-1, keepdim=True).values
+        sim_norm = sim_norm / (denom + 1e-8)
+
+        geo_scores = torch.zeros(N, K)
+        for i in range(N):
+            neighbours = torch.nonzero(adj[i], as_tuple=True)[0]
+            if len(neighbours) == 0:
+                geo_scores[i] = 1.0           # no constraint → don't penalise
+                continue
+            for ki in range(K):
+                cx, cy = topk_x[i, ki].item(), topk_y[i, ki].item()
+                ratios = []
+                for j in neighbours:
+                    j = j.item()
+                    d_src = ((src_x[i] - src_x[j]) ** 2 + (src_y[i] - src_y[j]) ** 2).sqrt().item()
+                    d_tgt = ((cx - anchor_x[j].item()) ** 2 + (cy - anchor_y[j].item()) ** 2) ** 0.5
+                    if d_src < 1e-3:
+                        ratios.append(1.0)
+                    else:
+                        ratios.append(np.exp(-((d_tgt / d_src - 1.0) ** 2) / (2 * sigma ** 2)))
+                geo_scores[i, ki] = sum(ratios) / len(ratios)
+
+        combined = alpha * sim_norm + (1 - alpha) * geo_scores.to(sim_norm.device)
+
+        # ── Stage 1c: 3D depth constraint (same-Part height ordering) ────────
+        #  For each pair of same-Part points (i, j) with valid 3D, the
+        #  vertical difference (Y_i - Y_j) from source 3D should be preserved
+        #  proportionally in image space (v_i - v_j) on the target.
+        #  This prevents cup-rim points from jumping to the cup body.
+        has_3d = (nodes_3d is not None and node_parts is not None
+                  and depth_weight > 0)
+        if has_3d:
+            beta = min(depth_weight, 1.0 - alpha)  # don't exceed budget
+            depth_scores = torch.ones(N, K, device=sim_norm.device)
+            sigma_d = 0.3  # tolerance for normalised depth-ordering deviation
+
+            for i in range(N):
+                pid_i = int(node_parts[i])
+                if np.isnan(nodes_3d[i, 0]):
+                    continue
+                # find same-Part peers with valid 3D (not necessarily neighbours)
+                peers = [j for j in range(N)
+                         if j != i and int(node_parts[j]) == pid_i
+                         and not np.isnan(nodes_3d[j, 0])]
+                if not peers:
+                    continue
+
+                # source Y differences (camera frame: Y axis ~ vertical)
+                src_y3d_i = nodes_3d[i, 1]
+                for ki in range(K):
+                    cy_cand = topk_y[i, ki].item()
+                    agree = []
+                    for j in peers:
+                        src_dy = src_y3d_i - nodes_3d[j, 1]   # 3D height diff
+                        src_dv = kps_arr[i, 1] - kps_arr[j, 1]  # source image v diff
+                        tgt_dv = cy_cand - anchor_y[j].item()    # target image v diff
+                        # check if direction of vertical offset is preserved
+                        if abs(src_dv) < 1e-3:
+                            agree.append(1.0)
+                        else:
+                            ratio = tgt_dv / src_dv
+                            agree.append(np.exp(-((ratio - 1.0) ** 2) / (2 * sigma_d ** 2)))
+                    depth_scores[i, ki] = sum(agree) / len(agree)
+
+            # re-weight: alpha * sim + (1-alpha-beta) * geo + beta * depth
+            geo_weight = max(0, 1.0 - alpha - beta)
+            combined = (alpha * sim_norm
+                        + geo_weight * geo_scores.to(sim_norm.device)
+                        + beta * depth_scores)
+
+        best_k = torch.argmax(combined, dim=-1)  # (N,)
+    else:
+        best_k = torch.zeros(N, dtype=torch.long)  # just take top-1
+
+    # gather initial matches (patch-resolution)
+    init_x = torch.tensor([topk_x[i, best_k[i]].item() for i in range(N)])
+    init_y = torch.tensor([topk_y[i, best_k[i]].item() for i in range(N)])
+
+    # ── Stage 2: Up-sampled local refinement ─────────────────────────────────
+    if refine_factor > 0:
+        UP = P * refine_factor                                       # 240
+        up_stride = img_size / UP                                    # 2.0
+        feat_src_up = F.interpolate(feat_src, size=(UP, UP), mode='bilinear', align_corners=False)
+        feat_tgt_up = F.interpolate(feat_tgt, size=(UP, UP), mode='bilinear', align_corners=False)
+        # normalise after interpolation
+        feat_src_up = feat_src_up / (feat_src_up.norm(dim=1, keepdim=True) + 1e-8)
+        feat_tgt_up = feat_tgt_up / (feat_tgt_up.norm(dim=1, keepdim=True) + 1e-8)
+
+        C = feat_src_up.shape[1]
+        results = []
+        W = refine_window   # half-size in upsampled pixels
+
+        for i in range(N):
+            # source descriptor at upsampled resolution
+            sx_up = int(round(kps_arr[i, 0] / up_stride))
+            sy_up = int(round(kps_arr[i, 1] / up_stride))
+            sx_up = max(0, min(UP - 1, sx_up))
+            sy_up = max(0, min(UP - 1, sy_up))
+            src_desc = feat_src_up[0, :, sy_up, sx_up]               # (C,)
+
+            # centre of search in target upsampled grid
+            cx_up = int(round(init_x[i].item() / up_stride))
+            cy_up = int(round(init_y[i].item() / up_stride))
+
+            # clipped window
+            y0 = max(0, cy_up - W)
+            y1 = min(UP, cy_up + W + 1)
+            x0 = max(0, cx_up - W)
+            x1 = min(UP, cx_up + W + 1)
+
+            patch = feat_tgt_up[0, :, y0:y1, x0:x1]                 # (C, h, w)
+            h, w = patch.shape[1], patch.shape[2]
+            local_sim = torch.einsum('c,chw->hw', src_desc, patch)   # (h, w)
+            best_local = local_sim.reshape(-1).argmax().item()
+            by, bx = divmod(best_local, w)
+
+            rx = (x0 + bx) * up_stride + up_stride / 2
+            ry = (y0 + by) * up_stride + up_stride / 2
+            rx = max(0, min(img_size - 1, rx))
+            ry = max(0, min(img_size - 1, ry))
+            results.append((int(round(rx)), int(round(ry))))
+
+        return results
+    else:
+        return [(int(round(init_x[i].item())), int(round(init_y[i].item())))
+                for i in range(N)]
 
 
 # ─── visualisation ────────────────────────────────────────────────────────────
@@ -345,15 +492,20 @@ def match(src_path: str,
           save_vis_flag: bool = True,
           device: str = 'cuda',
           half_precision: bool = False,
-          sd_size: int = NUM_PATCHES * 16) -> dict:
+          sd_size: int = NUM_PATCHES * 16,
+          top_k: int = 8,
+          alpha: float = 0.7,
+          refine_factor: int = 4,
+          depth_weight: float = 0.15) -> dict:
     """
-    Full matching pipeline. Returns the result dict (same as saved JSON).
-    Can be imported and called programmatically.
+    Full matching pipeline. Returns the result dict.
 
     half_precision: use FP16 for SD + DINOv2 weights, reducing VRAM from ~10 GB to ~5 GB.
-                    Recommended for GPUs with < 16 GB VRAM (RTX 3080/4080 etc.).
-    sd_size:        SD input resolution (default 960). Use 512 to further reduce peak VRAM
-                    during SD forward pass (~25% less activation memory). Slightly lower quality.
+    sd_size:        SD input resolution (default 960). Use 512 to further reduce peak VRAM.
+    top_k:          Stage-1 candidate count for topology-aware re-ranking (1 = legacy argmax).
+    alpha:          Blend weight appearance vs geometry (1.0 = appearance only).
+    depth_weight:   Blend weight for 3D depth constraint (0 = disable, requires nodes_3d in topo).
+    refine_factor:  Feature upsample factor for Stage-2 local refinement (0 = skip).
     """
     set_seed(42)
 
@@ -427,8 +579,18 @@ def match(src_path: str,
     torch.cuda.empty_cache()
 
     # ── correspondence ───────────────────────────────────────────────────────
-    print('[kp_match] Running correspondence ...')
-    tgt_kps_padded = find_correspondences(feat_src, feat_tgt, src_kps_padded, IMG_SIZE)
+    print(f'[kp_match] Running correspondence (top_k={top_k}, alpha={alpha}, refine={refine_factor}x) ...')
+    tgt_kps_padded = find_correspondences(
+        feat_src, feat_tgt, src_kps_padded,
+        adj_matrix=topo['adj_matrix'],
+        nodes_3d=topo.get('nodes_3d'),
+        node_parts=topo['node_parts'],
+        img_size=IMG_SIZE,
+        top_k=top_k,
+        alpha=alpha,
+        depth_weight=depth_weight,
+        refine_factor=refine_factor,
+    )
 
     del feat_src, feat_tgt
     gc.collect()
@@ -497,6 +659,18 @@ def main():
     parser.add_argument('--sd-size', type=int, default=NUM_PATCHES * 16, metavar='N',
                         help=f'SD input resolution (default: {NUM_PATCHES * 16}). '
                              'Use 512 to further reduce peak VRAM at slight quality cost.')
+    parser.add_argument('--top-k', type=int, default=8, metavar='K',
+                        help='Number of Top-K candidates per keypoint for topology '
+                             're-ranking (default: 8, 1 = legacy argmax).')
+    parser.add_argument('--alpha', type=float, default=0.7, metavar='A',
+                        help='Blend weight: appearance vs geometry '
+                             '(default: 0.7, 1.0 = appearance only).')
+    parser.add_argument('--refine', type=int, default=4, metavar='R',
+                        help='Feature upsample factor for sub-patch refinement '
+                             '(default: 4 → 60→240, 0 = skip).')
+    parser.add_argument('--depth-weight', type=float, default=0.15, metavar='B',
+                        help='Blend weight for 3D depth constraint '
+                             '(default: 0.15, 0 = disable, requires nodes_3d in topo).')
     args = parser.parse_args()
 
     for p in [args.src, args.kps, args.tgt, args.ckpt]:
@@ -512,6 +686,10 @@ def main():
         save_vis_flag=not args.no_vis,
         half_precision=args.fp16,
         sd_size=args.sd_size,
+        top_k=args.top_k,
+        alpha=args.alpha,
+        refine_factor=args.refine,
+        depth_weight=args.depth_weight,
     )
 
 

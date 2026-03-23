@@ -1,53 +1,25 @@
 """
 Topology keypoint selector for GeoAware-SC grasping pipeline.
 
-Build an expert-demonstration "topology graph" on a single image:
-  * Freely place any number of keypoints
-  * Assign each point to a Part (digit keys 0-9, preset as part_0 ... part_9)
-  * Connect points with edges (Tab -> EDGE mode)
-  * Rename used Parts before saving (optional)
-
 Usage
 -----
+    # 2D only
     python keypoints/kp_select.py <image_path>
 
-Output (saved alongside the input image):
-    <image_stem>_topo.npy   -- topology dict  (np.load(..., allow_pickle=True).item())
-    <image_stem>_topo.png   -- visualisation
+    # With RGBD → 3D back-projection saved into topology
+    python keypoints/kp_select.py <image_path> \\
+        --depth <depth.png> --intr <cam_intr.npy> \\
+        [--depth-scale 1000] [--depth-max 3.0]
 
-.npy dict structure
--------------------
-    {
-        "image_path":   str,
-        "image_width":  int,
-        "image_height": int,
-        "nodes":        np.ndarray,   # (N, 2) int32  -- [x, y] pixel coords
-        "node_parts":   np.ndarray,   # (N,)   int32  -- part id per node
-        "part_names":   dict,         # {int: str}     e.g. {0: "handle", 2: "rim"}
-        "adj_matrix":   np.ndarray,   # (N, N) int32  -- 0=no edge, 1=intra-part, 2=inter-part
-    }
+Output  <image_stem>_topo.npy + _topo.png
+------
+    nodes (N,2) int32, node_parts (N,), part_names {id:str},
+    adj_matrix (N,N) int32 (0=none, 1=intra, 2=inter)
+    + if depth provided: nodes_3d (N,3) float64, camera_intrinsics dict
 
-Controls -- SELECT mode (default)
-----------------------------------
-    Left-click      -> add keypoint (assigned to current Part)
-    Right-click / D -> remove last keypoint
-    U               -> clear ALL keypoints & edges
-    0-9             -> switch active Part id
-    Tab             -> toggle to EDGE mode
-    Enter / Q       -> quick-save with default part names & exit
-    N               -> name parts in terminal, then save & exit
-    Esc             -> exit WITHOUT saving
-    Scroll          -> zoom
-
-Controls -- EDGE mode
-----------------------
-    Left-click  -> select nearest point; click a 2nd point to form an edge
-    Right-click / D -> cancel pending selection, or undo last edge
-    Tab         -> toggle back to SELECT mode
-    Enter / Q       -> quick-save with default part names & exit
-    N               -> name parts in terminal, then save & exit
-    Esc             -> exit WITHOUT saving
-    Scroll      -> zoom
+Controls — SELECT mode: LClick add, RClick undo, 0-9 Part, Tab→EDGE
+Controls — EDGE mode:   LClick 2 pts to connect, RClick undo, Tab→SELECT
+Enter/Q save | N name-parts & save | Esc cancel | Scroll zoom
 """
 
 import argparse
@@ -79,13 +51,65 @@ def _part_colour(part_id: int) -> str:
     return _PART_COLOURS[part_id % len(_PART_COLOURS)]
 
 
+# ─── depth helpers (inlined from kp_3d.py to avoid circular imports) ─────────
+
+def _load_depth(path: str, depth_scale: float) -> np.ndarray:
+    """Return depth image as float32 array in **metres**."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.npy':
+        d = np.load(path).astype(np.float32)
+    elif ext == '.exr':
+        import cv2
+        d = cv2.imread(path, cv2.IMREAD_ANYDEPTH).astype(np.float32)
+    else:
+        d = np.array(Image.open(path)).astype(np.float32)
+    return d / depth_scale
+
+
+def _backproject(u: int, v: int, depth_m: float,
+                 fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
+    """Pixel (u=col, v=row) + metric depth → 3-D camera frame [X, Y, Z]."""
+    X = (u - cx) * depth_m / fx
+    Y = (v - cy) * depth_m / fy
+    Z = depth_m
+    return np.array([X, Y, Z], dtype=np.float64)
+
+
 class TopologySelector:
     """Interactive topology builder backed by Matplotlib."""
 
-    def __init__(self, image_path: str):
+    def __init__(self, image_path: str, *,
+                 depth_path: str | None = None,
+                 intr_path: str | None = None,
+                 fx: float = 0.0, fy: float = 0.0,
+                 cx: float = 0.0, cy: float = 0.0,
+                 depth_scale: float = 1000.0,
+                 depth_max: float = 3.0):
         self.image_path = os.path.abspath(image_path)
         self.img = Image.open(self.image_path).convert('RGB')
         self.img_w, self.img_h = self.img.size
+
+        # ── depth / intrinsics (optional) ────────────────────────────────────
+        self.depth_m: np.ndarray | None = None
+        self.depth_max = depth_max
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.depth_scale = depth_scale
+
+        if depth_path is not None:
+            self.depth_m = _load_depth(depth_path, depth_scale)
+            print(f'[topo] Depth loaded: {self.depth_m.shape}  '
+                  f'range [{self.depth_m.min():.3f}, {self.depth_m.max():.3f}] m')
+
+        if intr_path is not None:
+            K = np.load(intr_path)
+            assert K.shape == (3, 3), f'Expected 3×3 intrinsic matrix, got {K.shape}'
+            self.fx, self.fy = float(K[0, 0]), float(K[1, 1])
+            self.cx, self.cy = float(K[0, 2]), float(K[1, 2])
+            print(f'[topo] Intrinsics: fx={self.fx:.1f} fy={self.fy:.1f} '
+                  f'cx={self.cx:.1f} cy={self.cy:.1f}')
 
         # ── state ────────────────────────────────────────────────────────────
         self.mode: str = 'SELECT'              # 'SELECT' or 'EDGE'
@@ -409,6 +433,27 @@ class TopologySelector:
             'adj_matrix':   adj_matrix,
         }
 
+        # ── optional depth back-projection → nodes_3d ────────────────────────
+        if self.depth_m is not None and self.fx > 0 and self.fy > 0:
+            h_d, w_d = self.depth_m.shape
+            nodes_3d = np.full((N, 3), np.nan, dtype=np.float64)
+            for i in range(N):
+                u, v = int(nodes[i, 0]), int(nodes[i, 1])
+                u_c = max(0, min(w_d - 1, u))
+                v_c = max(0, min(h_d - 1, v))
+                d = float(self.depth_m[v_c, u_c])
+                if 0 < d < self.depth_max:
+                    nodes_3d[i] = _backproject(u_c, v_c, d, self.fx, self.fy,
+                                               self.cx, self.cy)
+            data['nodes_3d'] = nodes_3d
+            data['camera_intrinsics'] = {
+                'fx': self.fx, 'fy': self.fy,
+                'cx': self.cx, 'cy': self.cy,
+                'depth_scale': self.depth_scale,
+            }
+            valid = int(np.sum(~np.isnan(nodes_3d[:, 0])))
+            print(f'[topo] 3D back-projection: {valid}/{N} valid points')
+
         np.save(npy_path, data, allow_pickle=True)
         print(f'[topo] Saved topology → {npy_path}')
 
@@ -512,6 +557,21 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument('image_path', help='Path to the template image (jpg / png)')
+    # optional RGBD depth integration
+    parser.add_argument('--depth', default=None,
+                        help='Depth image (16-bit mm PNG / .npy / .exr). '
+                             'If given, 3D coords are saved alongside 2D nodes.')
+    parser.add_argument('--intr', default=None,
+                        help='Camera intrinsic matrix (.npy 3×3). '
+                             'Overrides --fx/--fy/--cx/--cy.')
+    parser.add_argument('--fx', type=float, default=0.0, help='Focal length x')
+    parser.add_argument('--fy', type=float, default=0.0, help='Focal length y')
+    parser.add_argument('--cx', type=float, default=0.0, help='Principal point x')
+    parser.add_argument('--cy', type=float, default=0.0, help='Principal point y')
+    parser.add_argument('--depth-scale', type=float, default=1000.0,
+                        help='raw / scale = metres (default 1000 for mm PNG)')
+    parser.add_argument('--depth-max', type=float, default=3.0,
+                        help='Discard depth beyond this (metres)')
     args = parser.parse_args()
 
     if not os.path.isfile(args.image_path):
@@ -522,7 +582,15 @@ def main():
     print('  EDGE   mode: Tab to enter, click two points to connect')
     print('  Enter/Q: quick save  |  N: name parts & save  |  Esc: cancel\n')
 
-    selector = TopologySelector(image_path=args.image_path)
+    selector = TopologySelector(
+        image_path=args.image_path,
+        depth_path=args.depth,
+        intr_path=args.intr,
+        fx=args.fx, fy=args.fy,
+        cx=args.cx, cy=args.cy,
+        depth_scale=args.depth_scale,
+        depth_max=args.depth_max,
+    )
     selector.run()
 
 
