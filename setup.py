@@ -62,6 +62,15 @@ assert torch_ver >= [1, 8], "Requires PyTorch >= 1.8"
 #        After installing ODISE deps (which pulls in sdkit), force-reinstall:
 #        pip install "pytorch-lightning>=1.8" "torchmetrics>=0.9" \
 #            --force-reinstall --no-deps
+# D-8  panopticapi is an undeclared runtime dependency (used by Mask2Former /
+#        ODISE but not in any requirements.txt). Install manually:
+#        pip install git+https://github.com/cocodataset/panopticapi.git
+# D-9  pytorch-lightning >= 2.0 removes
+#        pytorch_lightning.utilities.distributed.rank_zero_only.
+#        The SD weight-loading code (from stable-diffusion-sdkit) imports it,
+#        so you must pin pytorch-lightning < 2.0:
+#        pip install "pytorch-lightning>=1.8,<2.0"
+#        (tested with pytorch-lightning==1.9.5)
 #
 # [D-install] IMPORTANT pip install flags:
 #   All three `pip install -e` commands (this repo, Mask2Former, ODISE) MUST
@@ -108,7 +117,7 @@ setup(
         # code). We only call model.forward() for feature extraction — the
         # pytorch-lightning Trainer API (affected by the version change) is
         # never used. Training SD itself is out of scope for this project.
-        "pytorch-lightning>=1.8",
+        "pytorch-lightning>=1.8,<2.0",
         "torchmetrics>=0.9",
         f"mask2former @ file://localhost/{os.getcwd()}/third_party/Mask2Former/",
         f"odise @ file://localhost/{os.getcwd()}/third_party/ODISE/"

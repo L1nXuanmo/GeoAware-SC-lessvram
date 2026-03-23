@@ -255,16 +255,24 @@ def find_correspondences(feat_src: torch.Tensor,
 
 
 # ─── visualisation ────────────────────────────────────────────────────────────
-_COLOURS = [
-    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-    '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4',
+# Part-colour palette — identical to kp_select.py so visuals stay consistent.
+_PART_COLOURS = [
+    '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+    '#42d4f4', '#f032e6', '#bfef45', '#fabed4', '#469990',
+    '#dcbeff', '#9A6324', '#fffac8', '#800000', '#aaffc3',
+    '#808000', '#ffd8b1', '#000075', '#a9a9a9', '#ffe119',
 ]
+_EDGE_COLOUR_INTRA = '#ffffff'
+_EDGE_COLOUR_INTER = '#ff6600'
 
-def _colour(i):
-    return _COLOURS[i % len(_COLOURS)]
+
+def _part_colour(part_id: int) -> str:
+    return _PART_COLOURS[part_id % len(_PART_COLOURS)]
 
 
-def save_vis(src_img, tgt_img, src_kps, tgt_kps, names, out_path):
+def save_vis(src_img, tgt_img, src_kps, tgt_kps,
+             node_parts, part_names, adj_matrix, out_path):
+    """Side-by-side visualisation with part colours, labels, and topology edges."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -278,19 +286,49 @@ def save_vis(src_img, tgt_img, src_kps, tgt_kps, names, out_path):
     axes[1].imshow(np.array(tgt_img))
     axes[1].set_title('Target', fontsize=11)
 
-    for i, ((sx, sy), (tx, ty), name) in enumerate(zip(src_kps, tgt_kps, names)):
-        c = _colour(i)
-        axes[0].scatter(sx, sy, s=150, c=c, zorder=5, edgecolors='white', linewidths=1.5)
-        axes[0].annotate(f' {i}:{name}', (sx, sy), fontsize=8, color='white', fontweight='bold',
-                         bbox=dict(boxstyle='round,pad=0.2', fc=c, alpha=0.8, ec='none'))
-        axes[1].scatter(tx, ty, s=150, c=c, zorder=5, edgecolors='white', linewidths=1.5)
-        axes[1].annotate(f' {i}:{name}', (tx, ty), fontsize=8, color='white', fontweight='bold',
-                         bbox=dict(boxstyle='round,pad=0.2', fc=c, alpha=0.8, ec='none'))
-        # draw matching line between images using figure coords is complex −
-        # annotate with same colour is enough for clear correspondence
+    N = len(src_kps)
 
-    patches = [mpatches.Patch(color=_colour(i), label=f'{i}: {n}') for i, n in enumerate(names)]
-    fig.legend(handles=patches, loc='lower center', ncol=len(names), fontsize=9, framealpha=0.8)
+    # ── draw topology edges ──────────────────────────────────────────────────
+    for panel_kps, ax in [(src_kps, axes[0]), (tgt_kps, axes[1])]:
+        for a in range(N):
+            for b in range(a + 1, N):
+                val = adj_matrix[a, b]
+                if val == 0:
+                    continue
+                xa, ya = panel_kps[a]
+                xb, yb = panel_kps[b]
+                is_inter = (val == 2)
+                style = '--' if is_inter else '-'
+                colour = _EDGE_COLOUR_INTER if is_inter else _EDGE_COLOUR_INTRA
+                ax.plot([xa, xb], [ya, yb], style, color=colour,
+                        linewidth=1.5, alpha=0.8, zorder=3)
+
+    # ── draw nodes & labels ──────────────────────────────────────────────────
+    for i, ((sx, sy), (tx, ty)) in enumerate(zip(src_kps, tgt_kps)):
+        pid = int(node_parts[i])
+        c = _part_colour(pid)
+        pname = part_names.get(pid, f'part_{pid}')
+
+        for ax, x, y in [(axes[0], sx, sy), (axes[1], tx, ty)]:
+            ax.scatter(x, y, s=120, c=c, zorder=5, edgecolors='white', linewidths=1.2)
+            ax.annotate(
+                f'{i}:{pname}',
+                (x, y),
+                xytext=(12, 0),
+                textcoords='offset points',
+                fontsize=7, color='white', fontweight='bold',
+                va='center',
+                bbox=dict(boxstyle='round,pad=0.15', fc=c, alpha=0.75, ec='none'),
+            )
+
+    # ── legend ───────────────────────────────────────────────────────────────
+    used = sorted(set(int(p) for p in node_parts))
+    patches = [mpatches.Patch(
+        color=_part_colour(pid),
+        label=f'{part_names.get(pid, f"part_{pid}")} ({int(np.sum(node_parts == pid))} pts)',
+    ) for pid in used]
+    fig.legend(handles=patches, loc='lower center', ncol=max(1, len(used)),
+               fontsize=9, framealpha=0.8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -429,11 +467,10 @@ def match(src_path: str,
         vis_path = os.path.splitext(out_path)[0] + '_vis.png'
         src_img_disp = resize(src_img, target_res=IMG_SIZE, resize=True, to_pil=True)
         tgt_img_disp = resize(tgt_img, target_res=IMG_SIZE, resize=True, to_pil=True)
-        names = [kp['name'] for kp in kps_raw]
         save_vis(
             src_img_disp, tgt_img_disp,
             src_kps_padded, tgt_kps_padded,
-            names,
+            topo['node_parts'], topo['part_names'], topo['adj_matrix'],
             vis_path,
         )
 
